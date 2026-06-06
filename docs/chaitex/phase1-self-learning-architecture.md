@@ -171,6 +171,134 @@ Agent: skill_manage(action="patch", name="pdf-reader-v2",
 
 **Оценка**: ~800 строк Rust, 2-3 недели.
 
+#### 1.7 Migration Path и Protected Skills
+
+**Проблема**: После добавления `patch_skill` все 60 существующих навыков становятся мутабельными. Агент может случайно или злонамеренно испортить системные навыки, от которых зависит его собственное функционирование.
+
+**Решение**: Двухуровневая защита через поля в `skill.toml`.
+
+##### 1.7.1 Поля в skill.toml
+
+```toml
+[skill]
+name = "session-search"
+version = "1.0.0"
+# Флаг мутабельности — можно ли патчить/edit/delete навык
+mutable = false
+# Если true — навык вообще нельзя удалить или изменить,
+# даже с явного подтверждения пользователя
+protected = true
+```
+
+##### 1.7.2 Дефолты для разных категорий
+
+| Категория навыка | `mutable` | `protected` | Комментарий |
+|---|---|---|---|
+| Системные (bundled, ядро агента) | `false` | `true` | Навыки от которых зависит работа агента: tool dispatch, memory, session management |
+| Встроенные (bundled, утилиты) | `false` | `false` | Навыки из поставки: pdf-reader, code-review, github-pr, etc. Могут быть изменены при явном согласии пользователя |
+| Пользовательские (созданы агентом) | `true` | `false` | Создаются через `create_skill`, полностью мутабельны |
+
+##### 1.7.3 Проверки в SkillRegistry
+
+```rust
+impl SkillRegistry {
+    fn check_mutable(&self, name: &str, action: &str) -> Result<(), SkillError> {
+        let skill = self.get(name)?;
+
+        // Protected skills: полный запрет
+        if skill.config.protected {
+            return Err(SkillError::ProtectedSkill {
+                name: name.to_string(),
+                action: action.to_string(),
+                hint: "Этот навык защищён от изменений. "
+                      "Для разблокировки измените protected = false в skill.toml "
+                      "и перезагрузите агента.".to_string(),
+            });
+        }
+
+        // Immutable skills: запрет без подтверждения
+        if !skill.config.mutable {
+            return Err(SkillError::ImmutableSkill {
+                name: name.to_string(),
+                action: action.to_string(),
+                hint: "Навык помечен как immutable. "
+                      "Измените mutable = true в skill.toml для разрешения.".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+```
+
+##### 1.7.4 Migration Path
+
+Текущее состояние: 60 навыков в `bundled/`, ни в одном нет полей `mutable`/`protected`.
+
+**Шаг 1 (автоматический при сборке)**: Скрипт `scripts/protect-system-skills.sh`:
+```bash
+#!/bin/bash
+# Добавляет mutable = false, protected = true в skill.toml
+# для навыков из списка SYSTEM_SKILLS
+
+SYSTEM_SKILLS=(
+    "tool-dispatch"
+    "memory-core"
+    "session-manager"
+    "skill-manage"      # критично: защищает сам механизм патчинга
+    "event-bus"
+    "kernel-api"
+)
+
+for skill in "${SYSTEM_SKILLS[@]}"; do
+    if grep -q "^protected" "bundled/$skill/skill.toml"; then
+        continue  # уже размечен
+    fi
+    echo -e "\nmutable = false\nprotected = true" >> "bundled/$skill/skill.toml"
+done
+```
+
+**Шаг 2 (автоматический при сборке)**: Для остальных bundled-навыков:
+```bash
+# Добавляет mutable = false (без protected) в остальные skill.toml
+for skill_toml in bundled/*/skill.toml; do
+    if grep -q "^mutable" "$skill_toml"; then
+        continue
+    fi
+    echo -e "\nmutable = false" >> "$skill_toml"
+done
+```
+
+**Шаг 3 (в коде)**: `SkillRegistry::load_bundled()` при загрузке навыка без полей `mutable`/`protected`:
+- Если навык в списке `SYSTEM_SKILLS` → `mutable = false, protected = true`
+- Иначе → `mutable = false, protected = false`
+
+**Шаг 4 (для пользователя)**: Явная документация — какие навыки protected и почему, как разблокировать.
+
+##### 1.7.5 Список protected-навыков (предварительный)
+
+| Навык | Причина защиты |
+|---|---|
+| `skill-manage` | Защищает сам механизм патчинга от компрометации |
+| `tool-dispatch` | Ядро диспетчеризации инструментов |
+| `memory-core` / `memory-reason` | Базовые операции с памятью |
+| `session-manager` / `session-search` | Управление сессиями |
+| `event-bus` / `kernel-api` | Системная шина событий |
+| `security-scanner` / `prompt-injection` | Собственная безопасность агента |
+
+##### 1.7.6 Что будет при попытке патча protected-навыка
+
+```json
+{
+  "error": "ProtectedSkill",
+  "name": "skill-manage",
+  "action": "patch",
+  "hint": "Этот навык защищён от изменений. Для разблокировки измените protected = false в skill.toml и перезагрузите агента."
+}
+```
+
+Агент **не может** изменить `protected = false` через `patch_skill`, потому что этот вызов будет заблокирован раньше, чем дойдёт до файловой операции.
+
 ---
 
 ## Компонент 2: Memory Reasoning (Honcho-style)
@@ -353,6 +481,160 @@ impl ReasoningEngine {
 5. Глубокий синтез через LLM (chain-of-thought промпт)
 6. Confidence scoring
 ```
+
+##### 2.4.1 Бюджет reasoning и стоимость
+
+**Проблема**: Max reasoning при 100K+ токенов контекста + chain-of-thought может стоить $0.5–1.0 за один запрос. Пользователь должен это понимать и иметь контроль.
+
+##### Оценка потребления токенов по уровням
+
+| Уровень | LLM-вызовов | Входные токены | Выходные токены | Примерная стоимость* |
+|---|---|---|---|---|
+| **Minimal** | 0 | 0 | 0 | $0.00 |
+| **Low** | 1 | ~1K–2K | ~200–500 | $0.003–0.01 |
+| **Medium** | 1–2 | ~3K–8K | ~500–1.5K | $0.01–0.05 |
+| **High** | 2–3 | ~8K–25K | ~1.5K–5K | $0.05–0.25 |
+| **Max** | 3–5 | ~25K–80K+ | ~5K–20K+ | $0.25–1.00+ |
+
+*\*По тарифам GPT-4o / Claude Sonnet 4 на июнь 2026: ~$2.50–3.75/1M input, ~$10–15/1M output. Фактическая стоимость зависит от провайдера и модели.*
+
+##### Расчёт для Max reasoning (худший случай)
+
+```
+Вход:  80,000 токенов
+  - FTS5 search results:       ~15K токенов (сессии, факты, граф)
+  - Semantic search:            ~10K токенов
+  - User profile:               ~5K токенов
+  - Chain-of-thought промпт:    ~2K токенов
+  - Накопленный контекст:       ~48K токенов (история диалога)
+
+Выход: 15,000 токенов
+  - Chain-of-thought рассуждения: ~8K токенов
+  - Синтезированный ответ:        ~5K токенов
+  - Confidence scoring + JSON:    ~2K токенов
+
+Стоимость:
+  Input:  80K × $3.75/1M  = $0.30
+  Output: 15K × $15.00/1M  = $0.23
+  Итого: ~$0.53 за один Max-reasoning запрос
+
+При 5 итерациях chain-of-thought (Max уровень):
+  $0.53 × 5 = $2.65 за один reasoning-запрос
+```
+
+##### Факторы, увеличивающие стоимость
+
+1. **Размер контекста**. Если агент работает с 200K+ историей, входные токены утраиваются.
+2. **Число источников**. High/Max опрашивают 4 источника (semantic + FTS5 + graph + KV).
+3. **Chain-of-thought глубина**. Max делает 3-5 итераций рассуждения.
+4. **Модель провайдера**. GPT-4o vs Claude Opus vs локальная модель — разница в 10–50×.
+
+##### Механизмы контроля для пользователя
+
+**1. Конфигурация в `config.toml`:**
+
+```toml
+[reasoning]
+# Лимит токенов на один reasoning-запрос
+max_input_tokens = 40000
+max_output_tokens = 8000
+
+# Максимальный разрешённый уровень (minimal/low/medium/high/max)
+max_level = "high"
+
+# Месячный бюджет на reasoning (в USD)
+monthly_budget_usd = 50.0
+
+# Действие при превышении бюджета: "warn" | "block"
+budget_exceeded_action = "warn"
+
+# Разрешить Max уровень только с явного подтверждения
+require_approval_for_max = true
+```
+
+**2. Предупреждения агенту в системном промпте:**
+
+```
+[Budget Awareness]
+- Minimal/Low reasoning: используй свободно
+- Medium reasoning: не чаще 10 раз за сессию
+- High reasoning: не чаще 3 раз за сессию
+- Max reasoning: только по явному запросу пользователя
+- При превышении месячного бюджета reasoning отключается до конца периода
+```
+
+**3. Runtime-проверки в `ReasoningEngine`:**
+
+```rust
+impl ReasoningEngine {
+    async fn reason(&self, query: ReasoningQuery) -> Result<ReasoningResult, ReasoningError> {
+        // Проверка бюджета
+        let spent = self.budget_tracker.current_month_spent().await;
+        if spent >= self.config.monthly_budget_usd {
+            return match self.config.budget_exceeded_action {
+                BudgetAction::Warn => {
+                    tracing::warn!("Monthly reasoning budget exceeded (${:.2})", spent);
+                    // Продолжаем, но с понижением до Low
+                    self.reason_low(&query).await
+                }
+                BudgetAction::Block => {
+                    Err(ReasoningError::BudgetExceeded {
+                        spent,
+                        limit: self.config.monthly_budget_usd,
+                    })
+                }
+            };
+        }
+
+        // Проверка уровня
+        if query.level > self.config.max_level {
+            return Err(ReasoningError::LevelNotAllowed {
+                requested: query.level,
+                max_allowed: self.config.max_level,
+            });
+        }
+
+        // Max требует подтверждения
+        if query.level == ReasoningLevel::Max && self.config.require_approval_for_max {
+            return Err(ReasoningError::ApprovalRequired {
+                level: "max",
+                estimated_cost: self.estimate_cost(&query),
+            });
+        }
+
+        // ... выполнение
+    }
+}
+```
+
+**4. Трекинг и отчётность:**
+
+```rust
+pub struct BudgetTracker {
+    monthly_budget: f64,
+    current_month_spent: AtomicF64,
+    query_history: Vec<BudgetRecord>,
+}
+
+pub struct BudgetRecord {
+    pub timestamp: String,
+    pub level: ReasoningLevel,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated_cost: f64,
+    pub query_preview: String,  // первые 100 символов запроса
+}
+```
+
+##### Рекомендации по дефолтам
+
+| Параметр | Дефолт | Обоснование |
+|---|---|---|
+| `max_level` | `"high"` | Max только осознанно, не по умолчанию |
+| `monthly_budget_usd` | `20.0` | Разумный старт для индивидуального пользователя |
+| `require_approval_for_max` | `true` | Защита от неожиданных счетов |
+| `max_input_tokens` | `40000` | Достаточно для medium/high, ограничивает Max |
+| `budget_exceeded_action` | `"warn"` | Не блокировать жёстко, но предупреждать |
 
 #### 2.5 FTS5 для полнотекстового поиска
 
@@ -540,11 +822,12 @@ impl Tool for SessionSearchTool {
 
 | Компонент | Крейт | Строк Rust | Время | Приоритет |
 |-----------|-------|-----------|-------|-----------|
-| **Skill Self-Patching** | openfang-skills (расширение) | ~800 | 2-3 нед. | P0 |
-| **Memory Reasoning** | openfang-reasoning (новый) | ~1500 | 4-6 нед. | P0 |
+| **Skill Self-Patching** | openfang-skills (расширение) | ~1200 | 2-3 нед. | P0 |
+| **Memory Reasoning** | openfang-reasoning (новый) | ~2000 | 4-6 нед. | P0 |
 | **Session FTS5 Search** | openfang-memory (расширение) | ~200 | 1 нед. | P1 |
 | **Инструменты для агента** | openfang-runtime (3 новых tools) | ~600 | 2 нед. | P0 |
-| **Итого** | | ~3100 | 6-8 нед. | |
+| **Migration scripts + Budget tracker** | scripts/ + reasoning/budget.rs | ~400 | 1 нед. | P0 |
+| **Итого** | | ~4400 | 6-8 нед. | |
 
 ### Последовательность
 
@@ -566,3 +849,7 @@ Week 7-8:  UserProfile + memory_profile tool + integration tests
 4. **Security first.** Каждый patch/update навыка проходит prompt injection scan. Reasoning engine не пишет в память автоматически — только через явный `memory_conclude`.
 
 5. **Backward compatible.** Все новые методы — additive. Существующие навыки и память продолжают работать без изменений.
+
+6. **Protected skills + mutable flag.** Двухуровневая защита от accidental self-modification: `protected` (полный запрет) и `mutable` (opt-in). По умолчанию все существующие навыки иммутабельны — миграция явная через скрипты.
+
+7. **Reasoning budget control.** Пользователь контролирует стоимость через: лимит уровня (max_level), месячный бюджет ($20 дефолт), approval на Max, прозрачный трекинг потраченных токенов и долларов.
