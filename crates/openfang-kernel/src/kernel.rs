@@ -7979,6 +7979,29 @@ impl KernelHandle for OpenFangKernel {
         Some(&self.skill_registry)
     }
 
+    /// Plan 01-09: take a fresh snapshot of the registry after a
+    /// mutation. Acquires the read lock briefly, calls
+    /// `SkillRegistry::snapshot()` (a synchronous deep-clone), drops the
+    /// guard, returns the owned snapshot. If the lock is poisoned we
+    /// return `None` so the agent loop can fall back to its existing
+    /// snapshot rather than panic.
+    fn fresh_skill_snapshot(&self) -> Option<openfang_skills::registry::SkillRegistry> {
+        match self.skill_registry.read() {
+            Ok(guard) => {
+                let snap = guard.snapshot();
+                // Guard drops at end of scope — explicit drop for clarity.
+                drop(guard);
+                Some(snap)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "skill_registry read lock poisoned while taking fresh snapshot: {e}"
+                );
+                None
+            }
+        }
+    }
+
     // Plan 01-13: reasoning accessors so `tool_memory_reason` can call
     // into the engine + read the tracker without wrapping every call
     // site. All three return `None` on the trait default (test fakes);

@@ -310,6 +310,18 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// Take a fresh snapshot of the `SkillRegistry` (deep-clone via
+    /// `SkillRegistry::snapshot()`). Used by the agent loop after a
+    /// `skill_manage` mutation surfaces a `skill_refresh_required`
+    /// sentinel — see Phase 1 plan 01-09.
+    ///
+    /// Default returns `None` for test fakes; the kernel impl acquires
+    /// its registry RwLock briefly and clones. The lock guard MUST NOT
+    /// be held across an `.await` per the !Send guard rule.
+    fn fresh_skill_snapshot(&self) -> Option<openfang_skills::registry::SkillRegistry> {
+        None
+    }
+
     /// FTS5 search across stored session messages (plan 01-04).
     ///
     /// Wraps `openfang_memory::session::SessionStore::search_sessions_fts` so
