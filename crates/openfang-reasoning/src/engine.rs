@@ -74,11 +74,20 @@ async fn reason_low(
             "no LLM configured — Low+ levels require ReasoningEngine::with_llm".into(),
         ));
     };
-    let answer = llm
-        .synthesize(&query.query, &facts, ReasoningLevel::Low)
+    let (answer, usage) = llm
+        .synthesize_with_usage(&query.query, &facts, ReasoningLevel::Low)
         .await?;
-    let in_tokens = coarse_tokens(&query.query) + facts.iter().map(|f| coarse_tokens(&f.content)).sum::<u64>();
-    let out_tokens = coarse_tokens(&answer);
+    // Plan 01-13 invariant 5: when the driver returns a real
+    // TokenUsage we use those numbers verbatim; otherwise fall back to
+    // the chars/4 coarse estimate so the budget tracker still sees a
+    // non-zero spend for test-time mock LLMs.
+    let (in_tokens, out_tokens) = if usage.total() > 0 {
+        (usage.input_tokens, usage.output_tokens)
+    } else {
+        let it = coarse_tokens(&query.query)
+            + facts.iter().map(|f| coarse_tokens(&f.content)).sum::<u64>();
+        (it, coarse_tokens(&answer))
+    };
     if facts.is_empty() {
         // We still ran the LLM (per design § 2.4: Low always synthesizes
         // even if retrieval returned nothing — the model can return a
@@ -116,10 +125,16 @@ async fn reason_deep(
             "no LLM configured — Medium/High/Max require ReasoningEngine::with_llm".into(),
         ));
     };
-    let answer = llm.synthesize(&query.query, &facts, level).await?;
-    let in_tokens =
-        coarse_tokens(&query.query) + facts.iter().map(|f| coarse_tokens(&f.content)).sum::<u64>();
-    let out_tokens = coarse_tokens(&answer);
+    let (answer, usage) = llm
+        .synthesize_with_usage(&query.query, &facts, level)
+        .await?;
+    let (in_tokens, out_tokens) = if usage.total() > 0 {
+        (usage.input_tokens, usage.output_tokens)
+    } else {
+        let it = coarse_tokens(&query.query)
+            + facts.iter().map(|f| coarse_tokens(&f.content)).sum::<u64>();
+        (it, coarse_tokens(&answer))
+    };
     if facts.is_empty() {
         let mut r = first_turn_result(level);
         r.answer = answer;

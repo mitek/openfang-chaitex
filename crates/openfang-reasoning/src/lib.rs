@@ -18,6 +18,7 @@ pub mod budget;
 pub mod engine;
 pub mod error;
 pub mod fact_retrieval;
+pub mod kernel_llm;
 
 pub use budget::{
     format_effective_log, log_effective_reasoning_config, BudgetRecord, BudgetTracker,
@@ -25,6 +26,7 @@ pub use budget::{
 pub use engine::FIRST_TURN_CAVEAT;
 pub use error::ReasoningError;
 pub use fact_retrieval::retrieve_facts;
+pub use kernel_llm::{KernelLlm, KernelLlmAdapter};
 
 use openfang_types::agent::AgentId;
 use serde::{Deserialize, Serialize};
@@ -149,6 +151,26 @@ pub trait ReasoningLlm: Send + Sync {
         facts: &[FactReference],
         level: ReasoningLevel,
     ) -> Result<String, ReasoningError>;
+
+    /// Same as [`Self::synthesize`] but also returns the real
+    /// `TokenUsage` so the engine can record actual input/output token
+    /// counts in the budget tracker (plan 01-13 invariant 5: replace the
+    /// `coarse_tokens = chars/4` heuristic in `engine.rs` with real
+    /// numbers from the driver response).
+    ///
+    /// Default impl delegates to [`Self::synthesize`] and returns a
+    /// zero `TokenUsage`. The kernel-side `KernelLlmAdapter` (plan
+    /// 01-13) overrides this to pass the driver's real
+    /// `CompletionResponse.usage` through.
+    async fn synthesize_with_usage(
+        &self,
+        query: &str,
+        facts: &[FactReference],
+        level: ReasoningLevel,
+    ) -> Result<(String, openfang_types::message::TokenUsage), ReasoningError> {
+        let text = self.synthesize(query, facts, level).await?;
+        Ok((text, openfang_types::message::TokenUsage::default()))
+    }
 }
 
 /// The reasoning engine. Body filled in by plan 01-11 (level dispatch) and
