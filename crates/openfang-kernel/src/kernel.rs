@@ -7351,6 +7351,20 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Memory recall failed: {e}"))
     }
 
+    /// Plan 01-04: delegate the trait-level FTS search to the
+    /// `MemorySubstrate` pass-through. Wraps the `OpenFangError` into the
+    /// trait's `String` error contract.
+    fn session_search_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_id: Option<AgentId>,
+    ) -> Result<Vec<openfang_memory::session::SessionSearchHit>, String> {
+        self.memory
+            .search_sessions_fts(query, limit, agent_id.as_ref())
+            .map_err(|e| format!("Session FTS search failed: {e}"))
+    }
+
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
         let q = query.to_lowercase();
         self.registry

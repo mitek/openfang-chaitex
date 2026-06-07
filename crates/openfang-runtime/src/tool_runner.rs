@@ -310,6 +310,10 @@ pub async fn execute_tool(
         "memory_reason" => tool_memory_reason(input, kernel).await,
         // === END PHASE 1 PLAN 01-13 ===
 
+        // === PHASE 1 PLAN 01-04 session_search ===
+        "session_search" => tool_session_search(input, kernel).await,
+        // === END PHASE 1 PLAN 01-04 ===
+
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
         "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
@@ -1396,6 +1400,21 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // === END PHASE 1 PLAN 01-13 memory_reason schema ===
+        // === PHASE 1 PLAN 01-04 session_search schema ===
+        ToolDefinition {
+            name: "session_search".to_string(),
+            description: "Full-text search across all past conversation sessions. Use to recall what was discussed, decided, or discovered. Returns ranked hits with highlighted snippet, session_id, agent_id, role, timestamp, and bm25 score (lower = better match).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query":    { "type": "string", "description": "FTS5 search query" },
+                    "limit":    { "type": "integer", "description": "Max results (default 5, max 50)" },
+                    "agent_id": { "type": "string", "description": "Filter to a specific agent UUID" }
+                },
+                "required": ["query"]
+            }),
+        },
+        // === END PHASE 1 PLAN 01-04 session_search schema ===
     ]
 }
 
@@ -4313,6 +4332,69 @@ fn reasoning_error_to_json(err: &openfang_reasoning::ReasoningError) -> String {
     payload.to_string()
 }
 // === END PHASE 1 PLAN 01-13 ===
+
+// === PHASE 1 PLAN 01-04 session_search ===
+//
+// Dispatcher for the agent-facing `session_search` tool. Calls into the
+// kernel-held `MemorySubstrate.sessions` via the
+// `KernelHandle::session_search_fts` accessor added in the same plan.
+// Read-only — no capability gate.
+//
+// Result shape: a JSON array of hits `[{session_id, agent_id, role,
+// timestamp, snippet, score}, ...]`. Empty list ⇒ `"[]"`, never an error.
+async fn tool_session_search(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'query' parameter")?
+        .to_string();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).min(50))
+        .unwrap_or(5);
+    let agent_id = match input.get("agent_id").and_then(|v| v.as_str()) {
+        Some(s) => match s.parse::<openfang_types::agent::AgentId>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return Ok(serde_json::json!({
+                    "error": "InvalidAgentId",
+                    "tool": "session_search",
+                    "agent_id": s,
+                    "hint": "agent_id must be a valid UUID string.",
+                })
+                .to_string());
+            }
+        },
+        None => None,
+    };
+
+    let kh = match kernel {
+        Some(k) => k.as_ref(),
+        None => {
+            return Ok(serde_json::json!({
+                "error": "KernelUnavailable",
+                "tool": "session_search",
+                "hint": "session_search requires a kernel handle.",
+            })
+            .to_string());
+        }
+    };
+
+    match kh.session_search_fts(&query, limit, agent_id) {
+        Ok(hits) => serde_json::to_string(&hits).map_err(|e| e.to_string()),
+        Err(e) => Ok(serde_json::json!({
+            "error": "FtsSearchFailed",
+            "tool": "session_search",
+            "message": e,
+        })
+        .to_string()),
+    }
+}
+// === END PHASE 1 PLAN 01-04 ===
 
 #[cfg(test)]
 mod tests {

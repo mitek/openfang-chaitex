@@ -232,6 +232,20 @@ impl MemorySubstrate {
         self.sessions.delete_canonical_session(agent_id)
     }
 
+    /// FTS5 search across session messages (plan 01-04).
+    ///
+    /// Thin pass-through to [`SessionStore::search_sessions_fts`] so the
+    /// kernel-side `KernelHandle::session_search_fts` impl can dispatch
+    /// without exposing the private `sessions` field.
+    pub fn search_sessions_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_id: Option<&AgentId>,
+    ) -> OpenFangResult<Vec<crate::session::SessionSearchHit>> {
+        self.sessions.search_sessions_fts(query, limit, agent_id)
+    }
+
     /// Set or clear a session label.
     pub fn set_session_label(
         &self,

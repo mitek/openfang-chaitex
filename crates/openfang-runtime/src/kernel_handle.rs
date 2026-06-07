@@ -309,4 +309,21 @@ pub trait KernelHandle: Send + Sync {
     fn reasoning_config(&self) -> Option<openfang_types::config::ReasoningConfig> {
         None
     }
+
+    /// FTS5 search across stored session messages (plan 01-04).
+    ///
+    /// Wraps `openfang_memory::session::SessionStore::search_sessions_fts` so
+    /// the agent-facing `session_search` tool can call it without the trait
+    /// depending on `MemorySubstrate` directly. Default impl returns an
+    /// empty Vec for test fakes; the kernel implementation delegates to its
+    /// `MemorySubstrate.sessions`.
+    fn session_search_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_id: Option<openfang_types::agent::AgentId>,
+    ) -> Result<Vec<openfang_memory::session::SessionSearchHit>, String> {
+        let _ = (query, limit, agent_id);
+        Ok(Vec::new())
+    }
 }
