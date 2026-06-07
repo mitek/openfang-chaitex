@@ -16,6 +16,7 @@
 //! level. Plan 01-13's tool layer surfaces the caveat to the agent
 //! verbatim.
 
+use crate::budget::BudgetRecord;
 use crate::fact_retrieval::retrieve_facts;
 use crate::{
     FactReference, ReasoningEngine, ReasoningError, ReasoningLevel, ReasoningQuery,
@@ -40,6 +41,78 @@ pub async fn reason_impl(
             reason_deep(engine, query).await
         }
     }
+}
+
+/// Plan 01-13 invariant 6: wraps `reason_impl` with the pre/post-call
+/// `BudgetTracker` hooks.
+///
+/// Pre-call: if a tracker is wired, compare `current_month_spent` to
+/// `monthly_budget_usd`. On overrun:
+/// - `budget_exceeded_action == "block"` → return
+///   `ReasoningError::BudgetExceeded`.
+/// - any other value (treated as `"warn"`) → downgrade the query level
+///   to `Low`, run the dispatch, then prepend a structured caveat to
+///   the result.
+///
+/// Post-call: on success, record one `BudgetRecord` with the real level
+/// run and the `estimated_cost_usd` produced by the dispatch. A
+/// `record(...)` failure is logged but does NOT fail the reasoning call
+/// — accounting is best-effort relative to user-facing correctness.
+pub async fn reason_with_budget(
+    engine: &ReasoningEngine,
+    mut query: ReasoningQuery,
+) -> Result<ReasoningResult, ReasoningError> {
+    let original_query_text = query.query.clone();
+    let mut downgraded_from: Option<ReasoningLevel> = None;
+
+    if let Some(tracker) = engine.budget.as_ref() {
+        let spent = tracker.current_month_spent()?;
+        let limit = tracker.monthly_budget_usd();
+        if limit > 0.0 && spent >= limit {
+            match engine.budget_exceeded_action.as_str() {
+                "block" => {
+                    return Err(ReasoningError::BudgetExceeded { spent, limit });
+                }
+                _ => {
+                    // Warn mode: clamp downward only — never escalate.
+                    if query.level > ReasoningLevel::Low {
+                        downgraded_from = Some(query.level);
+                        query.level = ReasoningLevel::Low;
+                    }
+                }
+            }
+        }
+    }
+
+    let level_run = query.level;
+    let result = reason_impl(engine, query).await?;
+    let mut result = result;
+    if let Some(orig) = downgraded_from {
+        result.caveats.push(format!(
+            "Monthly reasoning budget exceeded — downgraded from {orig:?} to Low."
+        ));
+    }
+
+    if let Some(tracker) = engine.budget.as_ref() {
+        // Best-effort accounting. Tag a downgrade in the preview so
+        // forensic analysis can spot warn-mode downgrades.
+        let preview_src = if downgraded_from.is_some() {
+            format!("[downgraded] {original_query_text}")
+        } else {
+            original_query_text
+        };
+        let rec = BudgetRecord::new_now(
+            level_run,
+            0, // input_tokens placeholder when LLM is not invoked (Minimal)
+            0,
+            result.estimated_cost_usd,
+            &preview_src,
+        );
+        if let Err(e) = tracker.record(rec) {
+            tracing::warn!(error = %e, "BudgetTracker::record failed (accounting only — reasoning result still returned)");
+        }
+    }
+    Ok(result)
 }
 
 async fn reason_minimal(
@@ -411,5 +484,92 @@ mod tests {
         assert!(low < med);
         assert!(med < high);
         assert!(high < max);
+    }
+
+    // ===== Plan 01-13 BudgetTracker integration tests =====
+
+    use crate::budget::{BudgetRecord, BudgetTracker};
+
+    async fn spend_to_limit(tracker: &BudgetTracker, amount: f64) {
+        tracker
+            .record(BudgetRecord::new_now(
+                ReasoningLevel::High,
+                100,
+                50,
+                amount,
+                "seed-spend",
+            ))
+            .expect("record");
+    }
+
+    #[tokio::test]
+    async fn budget_block_returns_budget_exceeded_when_over_limit() {
+        let mem = fresh_memory();
+        let tracker = Arc::new(BudgetTracker::new(mem.clone(), 1.0));
+        spend_to_limit(&tracker, 2.0).await;
+        let engine = ReasoningEngine::new(mem)
+            .with_llm(Arc::new(MockLlm::default()))
+            .with_budget(tracker, "block");
+        let q = ReasoningQuery {
+            query: "x".to_string(),
+            level: ReasoningLevel::Medium,
+            agent_id: None,
+            max_facts: None,
+        };
+        let err = engine.reason(q).await.unwrap_err();
+        match err {
+            ReasoningError::BudgetExceeded { spent, limit } => {
+                assert!(spent >= 2.0);
+                assert!((limit - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_warn_downgrades_to_low_and_adds_caveat() {
+        let mem = fresh_memory();
+        seed_memory_fragment(&mem, "rust is great").await;
+        let tracker = Arc::new(BudgetTracker::new(mem.clone(), 0.50));
+        spend_to_limit(&tracker, 0.75).await;
+        let engine = ReasoningEngine::new(mem)
+            .with_llm(Arc::new(MockLlm::default()))
+            .with_budget(tracker, "warn");
+        let q = ReasoningQuery {
+            query: "rust".to_string(),
+            level: ReasoningLevel::Medium,
+            agent_id: None,
+            max_facts: None,
+        };
+        let r = engine.reason(q).await.expect("warn should not block");
+        assert_eq!(r.level, ReasoningLevel::Low, "warn must downgrade");
+        let cav = r.caveats.join("\n");
+        assert!(
+            cav.contains("downgraded"),
+            "expected downgrade caveat, got: {cav}"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_records_one_row_per_successful_call() {
+        let mem = fresh_memory();
+        seed_memory_fragment(&mem, "rust is great").await;
+        let tracker = Arc::new(BudgetTracker::new(mem.clone(), 100.0));
+        let engine = ReasoningEngine::new(mem)
+            .with_llm(Arc::new(MockLlm::default()))
+            .with_budget(tracker.clone(), "warn");
+        let spent_before = tracker.current_month_spent().unwrap();
+        let q = ReasoningQuery {
+            query: "rust".to_string(),
+            level: ReasoningLevel::Low,
+            agent_id: None,
+            max_facts: None,
+        };
+        engine.reason(q).await.expect("ok");
+        let spent_after = tracker.current_month_spent().unwrap();
+        assert!(
+            spent_after > spent_before,
+            "expected record to bump spent: {spent_before} -> {spent_after}"
+        );
     }
 }

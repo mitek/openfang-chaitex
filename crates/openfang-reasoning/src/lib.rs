@@ -189,13 +189,27 @@ pub struct ReasoningEngine {
     /// `has_llm()` reads this; field stays `pub(crate)` so plan 01-11 can
     /// `Option::as_deref` or `.expect("...")` in the dispatch body.
     pub(crate) llm: Option<Arc<dyn ReasoningLlm>>,
+    /// Optional budget tracker for pre/post-call accounting (plan 01-13
+    /// invariant 6). When `None`, the engine runs with no budget
+    /// enforcement and never records a row.
+    pub(crate) budget: Option<Arc<crate::budget::BudgetTracker>>,
+    /// Action to take when the monthly budget is exceeded. Mirrors
+    /// `ReasoningConfig.budget_exceeded_action`. Recognized values
+    /// `"warn"` (downgrade to Low + caveat) and `"block"` (return
+    /// `BudgetExceeded`). Any other value is treated as `"warn"`.
+    pub(crate) budget_exceeded_action: String,
 }
 
 impl ReasoningEngine {
     /// Construct an engine with the shared memory substrate and no LLM
     /// attached. Use [`Self::with_llm`] to attach one.
     pub fn new(memory: Arc<openfang_memory::MemorySubstrate>) -> Self {
-        Self { memory, llm: None }
+        Self {
+            memory,
+            llm: None,
+            budget: None,
+            budget_exceeded_action: "warn".to_string(),
+        }
     }
 
     /// Builder-style: attach an LLM seam. Required for `Medium+`; ignored
@@ -205,24 +219,42 @@ impl ReasoningEngine {
         self
     }
 
+    /// Builder-style: attach a budget tracker + the
+    /// `budget_exceeded_action` policy. When attached, `reason()` performs
+    /// the pre-call budget check (`current_month_spent >=
+    /// monthly_budget_usd`) and post-call records a `BudgetRecord` row.
+    pub fn with_budget(
+        mut self,
+        tracker: Arc<crate::budget::BudgetTracker>,
+        budget_exceeded_action: impl Into<String>,
+    ) -> Self {
+        self.budget = Some(tracker);
+        self.budget_exceeded_action = budget_exceeded_action.into();
+        self
+    }
+
     /// Whether an LLM is currently attached. Tests assert this without
     /// reaching into private fields.
     pub fn has_llm(&self) -> bool {
         self.llm.is_some()
     }
 
+    /// Whether a budget tracker is attached.
+    pub fn has_budget(&self) -> bool {
+        self.budget.is_some()
+    }
+
     /// Run a reasoning call.
     ///
     /// Dispatches by `query.level` per design § 2.4. Plan 01-11 lands the
-    /// body in `engine::reason_impl`; this method is a thin delegation
-    /// shell so the trait-object surface (and any future budget /
-    /// approval clamps in plan 01-12 / 01-13) can sit here without
-    /// requiring callers to import a separate module.
+    /// body in `engine::reason_impl`; plan 01-13 wraps it with the
+    /// `BudgetTracker` pre/post-call hooks (downgrade-to-Low in warn
+    /// mode, `BudgetExceeded` in block mode, post-call `record(...)`).
     pub async fn reason(
         &self,
         query: ReasoningQuery,
     ) -> Result<ReasoningResult, ReasoningError> {
-        crate::engine::reason_impl(self, query).await
+        crate::engine::reason_with_budget(self, query).await
     }
 }
 

@@ -188,6 +188,21 @@ pub struct OpenFangKernel {
     /// notifications after every mutation.
     pub skill_updated_tx:
         tokio::sync::broadcast::Sender<crate::skill_adapters::SkillUpdated>,
+    /// Reasoning subsystem budget tracker (plan 01-13 wiring).
+    ///
+    /// Built at boot from `MemorySubstrate` + `cfg.reasoning.monthly_budget_usd`.
+    /// Exposed to `KernelHandle::budget_tracker()` so the `memory_reason`
+    /// tool can read `current_month_spent` for the approval-gate UX and
+    /// the dashboard can render the current spend.
+    pub budget_tracker: OnceLock<Arc<openfang_reasoning::BudgetTracker>>,
+    /// Reasoning engine (plan 01-13 wiring).
+    ///
+    /// Built at boot with `ReasoningEngine::new(memory).with_llm(adapter)
+    /// .with_budget(tracker, budget_exceeded_action)`. The LLM adapter
+    /// wraps `Weak<OpenFangKernel>` to avoid keeping the kernel alive past
+    /// its shutdown.
+    pub reasoning_engine:
+        OnceLock<Arc<openfang_reasoning::ReasoningEngine>>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1230,6 +1245,8 @@ impl OpenFangKernel {
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
             skill_updated_tx: crate::skill_adapters::new_skill_updated_channel(),
+            budget_tracker: OnceLock::new(),
+            reasoning_engine: OnceLock::new(),
         };
 
         // Wire HAND.toml load events into the Merkle audit chain so reload
@@ -4097,11 +4114,48 @@ impl OpenFangKernel {
             .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e.to_string())))
     }
 
-    /// Set the weak self-reference for trigger dispatch.
+    /// Set the weak self-reference for trigger dispatch + initialize the
+    /// reasoning subsystem (plan 01-13).
     ///
-    /// Must be called once after the kernel is wrapped in `Arc`.
+    /// Must be called once after the kernel is wrapped in `Arc`. The
+    /// reasoning engine + budget tracker are constructed here (not at
+    /// `boot_with_config`) because the `KernelLlmAdapter` requires a
+    /// `Weak<OpenFangKernel>` — that weak handle only exists after the
+    /// kernel is inside an `Arc`.
     pub fn set_self_handle(self: &Arc<Self>) {
         let _ = self.self_handle.set(Arc::downgrade(self));
+        self.init_reasoning_subsystem();
+    }
+
+    /// Build the `BudgetTracker` + `ReasoningEngine` (with the
+    /// `KernelLlmAdapter` LLM seam pointed at this kernel) and stash both
+    /// in their `OnceLock` slots. Safe to call multiple times — the
+    /// `OnceLock::set` returns `Err` on a re-init and we ignore it.
+    fn init_reasoning_subsystem(self: &Arc<Self>) {
+        let tracker = Arc::new(openfang_reasoning::BudgetTracker::new(
+            self.memory.clone(),
+            self.config.reasoning.monthly_budget_usd,
+        ));
+        let _ = self.budget_tracker.set(tracker.clone());
+
+        let weak: Weak<OpenFangKernel> = Arc::downgrade(self);
+        let llm_adapter = Arc::new(openfang_reasoning::KernelLlmAdapter::new(
+            weak,
+            self.config.reasoning.max_input_tokens,
+            self.config.reasoning.max_output_tokens,
+        ));
+        let engine = openfang_reasoning::ReasoningEngine::new(self.memory.clone())
+            .with_llm(llm_adapter)
+            .with_budget(
+                tracker,
+                self.config.reasoning.budget_exceeded_action.clone(),
+            );
+        let _ = self.reasoning_engine.set(Arc::new(engine));
+
+        // Log the effective config line per addendum § C.2 (plan 01-12
+        // task 3 deliverable).
+        let cfg_path = self.config.home_dir.join("config.toml");
+        openfang_reasoning::log_effective_reasoning_config(&self.config.reasoning, &cfg_path);
     }
 
     // ─── Agent Binding management ──────────────────────────────────────
@@ -7902,6 +7956,75 @@ impl KernelHandle for OpenFangKernel {
         &self,
     ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
         Some(&self.skill_registry)
+    }
+
+    // Plan 01-13: reasoning accessors so `tool_memory_reason` can call
+    // into the engine + read the tracker without wrapping every call
+    // site. All three return `None` on the trait default (test fakes);
+    // the kernel returns `Some(...)` once `init_reasoning_subsystem`
+    // ran inside `set_self_handle`.
+    fn reasoning_engine(&self) -> Option<Arc<openfang_reasoning::ReasoningEngine>> {
+        self.reasoning_engine.get().cloned()
+    }
+
+    fn budget_tracker(&self) -> Option<Arc<openfang_reasoning::BudgetTracker>> {
+        self.budget_tracker.get().cloned()
+    }
+
+    fn reasoning_config(&self) -> Option<openfang_types::config::ReasoningConfig> {
+        Some(self.config.reasoning.clone())
+    }
+}
+
+// --- Plan 01-13: KernelLlm impl so the ReasoningEngine's
+// `KernelLlmAdapter` can call back into the kernel's existing LLM
+// driver. Synthesizes a single completion with the default driver +
+// model. Returns the driver's real `TokenUsage`. ---
+#[async_trait]
+impl openfang_reasoning::KernelLlm for OpenFangKernel {
+    async fn complete_for_reasoning(
+        &self,
+        prompt: &str,
+        max_output_tokens: u32,
+        level: openfang_reasoning::ReasoningLevel,
+    ) -> Result<
+        (String, openfang_types::message::TokenUsage),
+        openfang_reasoning::ReasoningError,
+    > {
+        use openfang_runtime::llm_driver::CompletionRequest;
+        use openfang_types::message::Message;
+
+        // Level → sampling temperature. Higher levels demand more
+        // careful reasoning; we drop temperature for High/Max so the
+        // output stays grounded in the supplied facts.
+        let temperature = match level {
+            openfang_reasoning::ReasoningLevel::Minimal => 0.0,
+            openfang_reasoning::ReasoningLevel::Low => 0.2,
+            openfang_reasoning::ReasoningLevel::Medium => 0.3,
+            openfang_reasoning::ReasoningLevel::High => 0.2,
+            openfang_reasoning::ReasoningLevel::Max => 0.1,
+        };
+
+        let request = CompletionRequest {
+            model: self.config.default_model.model.clone(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            max_tokens: max_output_tokens,
+            temperature,
+            system: Some(
+                "You are a memory-recall reasoning assistant. Synthesize concise, grounded answers from the supplied facts. Cite using the [source] tags provided."
+                    .to_string(),
+            ),
+            thinking: None,
+        };
+
+        let resp = self
+            .default_driver
+            .complete(request)
+            .await
+            .map_err(|e| openfang_reasoning::ReasoningError::Llm(e.to_string()))?;
+        let text = resp.text();
+        Ok((text, resp.usage))
     }
 }
 

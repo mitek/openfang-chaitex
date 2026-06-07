@@ -289,4 +289,24 @@ pub trait KernelHandle: Send + Sync {
     ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
         None
     }
+
+    /// Borrow the kernel's `ReasoningEngine` (plan 01-13).
+    ///
+    /// Returns `None` for kernel implementations that don't expose one
+    /// (test fakes). The kernel wires its engine inside
+    /// `set_self_handle` after Arc wrapping.
+    fn reasoning_engine(&self) -> Option<std::sync::Arc<openfang_reasoning::ReasoningEngine>> {
+        None
+    }
+
+    /// Borrow the kernel's `BudgetTracker` (plan 01-13).
+    fn budget_tracker(&self) -> Option<std::sync::Arc<openfang_reasoning::BudgetTracker>> {
+        None
+    }
+
+    /// Borrow the kernel's effective `[reasoning]` config (plan 01-13).
+    /// Returns an owned clone so the trait method shape stays sync.
+    fn reasoning_config(&self) -> Option<openfang_types::config::ReasoningConfig> {
+        None
+    }
 }
