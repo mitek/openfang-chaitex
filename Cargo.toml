@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/openfang-types",
     "crates/openfang-memory",
+    "crates/openfang-reasoning",
     "crates/openfang-runtime",
     "crates/openfang-wire",
     "crates/openfang-api",

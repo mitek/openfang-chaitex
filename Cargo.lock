@@ -4221,6 +4221,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfang-reasoning"
+version = "0.6.9"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "openfang-memory",
+ "openfang-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "openfang-runtime"
 version = "0.6.9"
 dependencies = [
