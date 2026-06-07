@@ -75,21 +75,33 @@ impl SessionStore {
     }
 
     /// Save a session to the database.
+    ///
+    /// Transactionally writes the msgpack BLOB to `sessions` AND rewrites the
+    /// flat `session_messages` rows for the session so the FTS5 index (kept in
+    /// sync by triggers from plan 01-02) reflects the latest messages.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let messages_blob = rmp_serde::to_vec_named(&session.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        let session_id_str = session.id.0.to_string();
+        let agent_id_str = session.agent_id.0.to_string();
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        // 1. Primary BLOB upsert — read path stays unchanged.
+        tx.execute(
             "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, label, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(id) DO UPDATE SET messages = ?3, context_window_tokens = ?4, label = ?5, updated_at = ?6",
             rusqlite::params![
-                session.id.0.to_string(),
-                session.agent_id.0.to_string(),
+                session_id_str,
+                agent_id_str,
                 messages_blob,
                 session.context_window_tokens as i64,
                 session.label.as_deref(),
@@ -97,6 +109,47 @@ impl SessionStore {
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        // 2. Wipe any existing flat rows for this session — full rewrite
+        //    keeps the flat table consistent with the BLOB when messages are
+        //    edited/removed in-place. FTS5 `session_messages_ad` trigger
+        //    handles the index cleanup.
+        tx.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1",
+            rusqlite::params![session_id_str],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        // 3. Insert one flat row per message, using the plan 01-01 flattener
+        //    + role mapper. Skip messages that flatten to empty text — there
+        //    is nothing to index for them.
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO session_messages (session_id, agent_id, message_index, role, content, timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            for (idx, msg) in session.messages.iter().enumerate() {
+                let content = crate::session_fts::flatten_message_content(msg);
+                if content.is_empty() {
+                    continue;
+                }
+                let role = crate::session_fts::role_string(&msg.role);
+                stmt.execute(rusqlite::params![
+                    session_id_str,
+                    agent_id_str,
+                    idx as i64,
+                    role,
+                    content,
+                    now,
+                ])
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
     }
 
@@ -106,9 +159,17 @@ impl SessionStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let session_id_str = session_id.0.to_string();
         conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id.0.to_string()],
+            rusqlite::params![session_id_str],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        // Cascade flat rows; FTS5 `session_messages_ad` trigger drains the
+        // inverted index automatically.
+        conn.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1",
+            rusqlite::params![session_id_str],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
@@ -120,9 +181,16 @@ impl SessionStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let agent_id_str = agent_id.0.to_string();
         conn.execute(
             "DELETE FROM sessions WHERE agent_id = ?1",
-            rusqlite::params![agent_id.0.to_string()],
+            rusqlite::params![agent_id_str],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        // Cascade flat rows; FTS5 trigger keeps the index in sync.
+        conn.execute(
+            "DELETE FROM session_messages WHERE agent_id = ?1",
+            rusqlite::params![agent_id_str],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
@@ -812,5 +880,121 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    // ---- plan 01-03 dual-write + cascade tests ----
+
+    fn count_flat_rows(store: &SessionStore, session_id: &SessionId) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+            rusqlite::params![session_id.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_flat_rows_for_agent(store: &SessionStore, agent_id: &AgentId) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_messages WHERE agent_id = ?1",
+            rusqlite::params![agent_id.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_fts_hits(store: &SessionStore, term: &str) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_messages_fts WHERE session_messages_fts MATCH ?1",
+            rusqlite::params![term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn save_session_populates_flat_table_and_fts() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session
+            .messages
+            .push(Message::user("the ferrocene project"));
+        session
+            .messages
+            .push(Message::assistant("ferrocene is a rust toolchain"));
+        store.save_session(&session).unwrap();
+
+        let flat = count_flat_rows(&store, &session.id);
+        assert!(flat >= 2, "expected at least 2 flat rows, got {}", flat);
+        let hits = count_fts_hits(&store, "ferrocene");
+        assert!(hits >= 1, "expected at least 1 FTS hit, got {}", hits);
+    }
+
+    #[test]
+    fn save_session_replaces_flat_rows_on_resave() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session.messages.push(Message::user("ferrocene rocks"));
+        store.save_session(&session).unwrap();
+        assert!(count_fts_hits(&store, "ferrocene") >= 1);
+
+        // Replace the message content and re-save the same session.
+        session.messages.clear();
+        session.messages.push(Message::user("zircon is metal"));
+        store.save_session(&session).unwrap();
+
+        // Flat table should reflect ONLY the new content — no duplicates,
+        // and the old term should no longer match in the FTS index.
+        let flat = count_flat_rows(&store, &session.id);
+        assert_eq!(
+            flat, 1,
+            "expected exactly one flat row after resave, got {}",
+            flat
+        );
+        assert_eq!(
+            count_fts_hits(&store, "ferrocene"),
+            0,
+            "stale FTS hit found after resave"
+        );
+        assert!(count_fts_hits(&store, "zircon") >= 1);
+    }
+
+    #[test]
+    fn delete_session_cascades_to_flat_and_fts() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session.messages.push(Message::user("ferrocene topic"));
+        store.save_session(&session).unwrap();
+        assert!(count_flat_rows(&store, &session.id) >= 1);
+        assert!(count_fts_hits(&store, "ferrocene") >= 1);
+
+        store.delete_session(session.id).unwrap();
+
+        assert_eq!(count_flat_rows(&store, &session.id), 0);
+        assert_eq!(count_fts_hits(&store, "ferrocene"), 0);
+    }
+
+    #[test]
+    fn delete_agent_sessions_cascades() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let mut s1 = store.create_session(agent_id).unwrap();
+        s1.messages.push(Message::user("alpha"));
+        store.save_session(&s1).unwrap();
+
+        let mut s2 = store.create_session(agent_id).unwrap();
+        s2.messages.push(Message::user("beta"));
+        store.save_session(&s2).unwrap();
+
+        assert!(count_flat_rows_for_agent(&store, &agent_id) >= 2);
+
+        store.delete_agent_sessions(agent_id).unwrap();
+        assert_eq!(count_flat_rows_for_agent(&store, &agent_id), 0);
     }
 }
