@@ -14,6 +14,7 @@ pub mod knowledge;
 pub mod migration;
 pub mod semantic;
 pub mod session;
+pub mod session_fts;
 pub mod structured;
 pub mod usage;
 
