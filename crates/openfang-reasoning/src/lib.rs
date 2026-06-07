@@ -15,12 +15,16 @@
 //!   Max`); ordering is preserved by `derive(PartialOrd, Ord)`.
 
 pub mod budget;
+pub mod engine;
 pub mod error;
+pub mod fact_retrieval;
 
 pub use budget::{
     format_effective_log, log_effective_reasoning_config, BudgetRecord, BudgetTracker,
 };
+pub use engine::FIRST_TURN_CAVEAT;
 pub use error::ReasoningError;
+pub use fact_retrieval::retrieve_facts;
 
 use openfang_types::agent::AgentId;
 use serde::{Deserialize, Serialize};
@@ -154,13 +158,7 @@ pub trait ReasoningLlm: Send + Sync {
 pub struct ReasoningEngine {
     /// Memory access for fact retrieval. Held as `Arc` because the engine
     /// lives behind an `Arc` on the kernel side and the substrate is shared
-    /// across the whole kernel.
-    ///
-    /// `#[allow(dead_code)]`: stored but unread until plan 01-11 lands the
-    /// level-dispatch body that issues fact retrievals. Documented here so
-    /// a future maintainer reading the warning knows the field is held on
-    /// purpose, not by accident.
-    #[allow(dead_code)]
+    /// across the whole kernel. Plan 01-11 reads this in `engine::reason_impl`.
     pub(crate) memory: Arc<openfang_memory::MemorySubstrate>,
     /// Optional LLM seam. `None` is allowed so `Minimal`/`Low` lookups
     /// (which need no synthesis) work without an LLM hooked up — useful in
@@ -193,17 +191,16 @@ impl ReasoningEngine {
 
     /// Run a reasoning call.
     ///
-    /// Returns `ReasoningError::NotYetImplemented` until plan 01-11 lands
-    /// the dispatch body. The error is structured so downstream plans can
-    /// confirm wiring works (the error reaches the tool layer) without
-    /// silently returning empty `ReasoningResult` values.
+    /// Dispatches by `query.level` per design § 2.4. Plan 01-11 lands the
+    /// body in `engine::reason_impl`; this method is a thin delegation
+    /// shell so the trait-object surface (and any future budget /
+    /// approval clamps in plan 01-12 / 01-13) can sit here without
+    /// requiring callers to import a separate module.
     pub async fn reason(
         &self,
-        _query: ReasoningQuery,
+        query: ReasoningQuery,
     ) -> Result<ReasoningResult, ReasoningError> {
-        Err(ReasoningError::NotYetImplemented(
-            "ReasoningEngine::reason — body lands in plan 01-11".into(),
-        ))
+        crate::engine::reason_impl(self, query).await
     }
 }
 
@@ -279,29 +276,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_reason_returns_not_yet_implemented() {
+    async fn engine_reason_minimal_smoke_test() {
+        // Plan 01-11 replaced the NotYetImplemented stub with the real
+        // five-level dispatch. Minimal on an empty memory should still
+        // return Ok (no LLM call required) with the first-turn caveat.
         let _ = MemoryConfig::default(); // touch the import path
         let engine = ReasoningEngine::new(fresh_memory());
-        assert!(
-            !engine.has_llm(),
-            "fresh engine should not have an LLM attached"
-        );
+        assert!(!engine.has_llm(), "fresh engine should not have an LLM");
         let q = ReasoningQuery {
             query: "smoke test".to_string(),
             level: ReasoningLevel::Minimal,
             agent_id: None,
             max_facts: None,
         };
-        match engine.reason(q).await {
-            Err(ReasoningError::NotYetImplemented(msg)) => {
-                assert!(
-                    msg.contains("01-11"),
-                    "error message must reference plan 01-11, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected NotYetImplemented, got {:?}", other),
-        }
+        let r = engine.reason(q).await.expect("Minimal on empty memory must Ok");
+        assert_eq!(r.level, ReasoningLevel::Minimal);
+        // Empty memory ⇒ no facts ⇒ first-turn caveat surfaces.
+        assert!(r.supporting_facts.is_empty());
+        assert!((r.confidence - 0.0).abs() < 1e-9);
+        assert_eq!(r.caveats.len(), 1);
+        assert_eq!(r.caveats[0], crate::FIRST_TURN_CAVEAT);
     }
 
     #[test]
