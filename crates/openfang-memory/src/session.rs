@@ -5,9 +5,32 @@ use openfang_types::agent::{AgentId, SessionId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// A single hit returned by [`SessionStore::search_sessions_fts`].
+///
+/// Shape is owned (no borrowed lifetimes) so the value can be serialized
+/// straight back to an agent via the `session_search` tool (plan 01-04)
+/// and reused by `openfang-reasoning::fact_retrieval::fts5_session_search`
+/// (which now delegates to this helper for one canonical SQL impl).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    /// The session that contains the matched message.
+    pub session_id: String,
+    /// The agent that owns the session.
+    pub agent_id: String,
+    /// Role of the matched message (`user`/`assistant`/`system`).
+    pub role: String,
+    /// RFC3339 timestamp of the matched row (`session_messages.timestamp`).
+    pub timestamp: String,
+    /// FTS5 `snippet(...)` excerpt with `<b>...</b>` highlight markers.
+    pub snippet: String,
+    /// bm25 score — lower is better (negative in practice).
+    pub score: f64,
+}
 
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
@@ -328,6 +351,93 @@ impl SessionStore {
 }
 
 impl SessionStore {
+    /// Full-text search across `session_messages_fts` (v9 schema, plan 01-02).
+    ///
+    /// Returns BM25-ranked hits ordered best-first. `limit` is capped server-side
+    /// at 50 for sanity. `agent_id`, when `Some`, narrows the match to that
+    /// agent's messages only. The SQL is the canonical implementation lifted from
+    /// `openfang-reasoning::fact_retrieval` so the agent-facing `session_search`
+    /// tool and the reasoning fact-retrieval path share one query path.
+    ///
+    /// Lock discipline: holds the SQLite mutex synchronously for the duration of
+    /// the query and drops it before returning. Never call this across an
+    /// `.await` boundary that needs `Send` — wrap in `spawn_blocking` if you must.
+    pub fn search_sessions_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_id: Option<&AgentId>,
+    ) -> OpenFangResult<Vec<SessionSearchHit>> {
+        const HARD_CAP: usize = 50;
+        let lim = limit.min(HARD_CAP) as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        // bm25 returns lower=better. The snippet() column 0 means we highlight
+        // the `content` column of the FTS5 virtual table.
+        let sql_base = "SELECT m.session_id, m.agent_id, m.role, m.timestamp,
+                            snippet(session_messages_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
+                            bm25(session_messages_fts) AS score
+                     FROM session_messages_fts
+                     JOIN session_messages m ON m.rowid = session_messages_fts.rowid
+                     WHERE session_messages_fts MATCH ?1";
+
+        let rows: Vec<SessionSearchHit> = if let Some(aid) = agent_id {
+            let sql = format!(
+                "{sql_base} AND m.agent_id = ?2 ORDER BY score LIMIT ?3"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mapped = stmt
+                .query_map(
+                    rusqlite::params![query, aid.0.to_string(), lim],
+                    |row| {
+                        Ok(SessionSearchHit {
+                            session_id: row.get(0)?,
+                            agent_id: row.get(1)?,
+                            role: row.get(2)?,
+                            timestamp: row.get(3)?,
+                            snippet: row.get(4)?,
+                            score: row.get::<_, f64>(5).unwrap_or(0.0),
+                        })
+                    },
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut out = Vec::new();
+            for hit in mapped {
+                out.push(hit.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+            }
+            out
+        } else {
+            let sql = format!("{sql_base} ORDER BY score LIMIT ?2");
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mapped = stmt
+                .query_map(rusqlite::params![query, lim], |row| {
+                    Ok(SessionSearchHit {
+                        session_id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                        role: row.get(2)?,
+                        timestamp: row.get(3)?,
+                        snippet: row.get(4)?,
+                        score: row.get::<_, f64>(5).unwrap_or(0.0),
+                    })
+                })
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut out = Vec::new();
+            for hit in mapped {
+                out.push(hit.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+            }
+            out
+        };
+
+        Ok(rows)
+    }
+
     /// List all sessions for a specific agent.
     pub fn list_agent_sessions(&self, agent_id: AgentId) -> OpenFangResult<Vec<serde_json::Value>> {
         let conn = self
@@ -996,5 +1106,79 @@ mod tests {
 
         store.delete_agent_sessions(agent_id).unwrap();
         assert_eq!(count_flat_rows_for_agent(&store, &agent_id), 0);
+    }
+
+    // ---- plan 01-04 search_sessions_fts tests ----
+
+    #[test]
+    fn search_sessions_fts_returns_hit_with_snippet() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let mut session = store.create_session(agent_id).unwrap();
+        session.messages.push(Message::user("the octopus garden"));
+        session
+            .messages
+            .push(Message::assistant("octopus is a clever animal"));
+        store.save_session(&session).unwrap();
+
+        let hits = store
+            .search_sessions_fts("octopus", 5, None)
+            .expect("search ok");
+        assert!(
+            hits.len() >= 2,
+            "expected at least 2 hits, got {}",
+            hits.len()
+        );
+        // Snippet must include the highlight tags.
+        assert!(
+            hits[0].snippet.contains("<b>") && hits[0].snippet.contains("</b>"),
+            "expected snippet highlight, got: {}",
+            hits[0].snippet
+        );
+        assert_eq!(hits[0].session_id, session.id.0.to_string());
+        assert_eq!(hits[0].agent_id, agent_id.0.to_string());
+    }
+
+    #[test]
+    fn search_sessions_fts_agent_filter_narrows() {
+        let store = setup();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        let mut sa = store.create_session(agent_a).unwrap();
+        sa.messages.push(Message::user("neutrino observation log"));
+        store.save_session(&sa).unwrap();
+
+        let mut sb = store.create_session(agent_b).unwrap();
+        sb.messages.push(Message::user("neutrino arrival data"));
+        store.save_session(&sb).unwrap();
+
+        // Unfiltered: at least 2 hits.
+        let all = store.search_sessions_fts("neutrino", 10, None).unwrap();
+        assert!(all.len() >= 2, "unfiltered should see both agents");
+
+        // Filter to agent_a only.
+        let only_a = store
+            .search_sessions_fts("neutrino", 10, Some(&agent_a))
+            .unwrap();
+        assert_eq!(only_a.len(), 1, "agent filter must narrow to one");
+        assert_eq!(only_a[0].agent_id, agent_a.0.to_string());
+    }
+
+    #[test]
+    fn search_sessions_fts_limit_cap_respected() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let mut session = store.create_session(agent_id).unwrap();
+        for i in 0..10 {
+            session
+                .messages
+                .push(Message::user(format!("zircon entry {i}")));
+        }
+        store.save_session(&session).unwrap();
+
+        let hits = store.search_sessions_fts("zircon", 3, None).unwrap();
+        assert!(hits.len() <= 3, "limit not respected, got {}", hits.len());
     }
 }

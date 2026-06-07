@@ -98,11 +98,22 @@ async fn semantic_recall(
 
 /// FTS5 search against `session_messages_fts` (created by v9, plan 01-02).
 ///
-/// SQLite calls are sync — wrapped in `tokio::task::spawn_blocking` so the
-/// `!Send` rusqlite connection mutex never crosses an `.await`. Any
-/// `MATCH`-syntax problem in the user's query degrades to an empty result
-/// (we WARN-log it but never propagate — the FTS path is a best-effort
-/// addition, not a critical retrieval source).
+/// Plan 01-04 lifted the SQL into `SessionStore::search_sessions_fts` so the
+/// agent-facing `session_search` tool and this reasoning path share one
+/// canonical implementation. We wrap the (sync) substrate call in
+/// `tokio::task::spawn_blocking` so the `!Send` rusqlite mutex never crosses
+/// an `.await`. Any `MATCH`-syntax problem degrades to an empty result
+/// (WARN-logged) — the FTS path is a best-effort addition, not a critical
+/// retrieval source.
+///
+/// The `score` field returned by `SessionStore::search_sessions_fts` is the
+/// raw bm25 rank (lower / more negative = better). We invert it to a
+/// `[0, 1]` relevance for `FactReference` via `1 / (1 + |score|)`. The
+/// `message_index` in the resulting `FactSource::Session` is left at 0 here:
+/// the new helper returns the row-level `(session_id, agent_id, role,
+/// timestamp, snippet, score)` shape — for the reasoning callers the
+/// `message_index` was historically unused downstream, so we keep the
+/// signature stable and drop the field.
 async fn fts5_session_search(
     memory: &Arc<MemorySubstrate>,
     query: &str,
@@ -111,59 +122,39 @@ async fn fts5_session_search(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let conn_arc = memory.usage_conn();
+    // Build an owned SessionStore over the shared connection so the blocking
+    // task is Send. `SessionStore::new` is cheap — it just wraps the existing
+    // `Arc<Mutex<Connection>>` returned by `usage_conn()`.
+    let store = openfang_memory::session::SessionStore::new(memory.usage_conn());
     let q = query.to_string();
-    let lim = limit as i64;
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<FactReference>, String> {
-        let conn = conn_arc.lock().map_err(|e| format!("conn lock poisoned: {e}"))?;
-        let mut stmt = match conn.prepare(
-            "SELECT session_id, message_index, content, role, timestamp,
-                    bm25(session_messages_fts) AS rank
-             FROM session_messages_fts
-             WHERE session_messages_fts MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
-        ) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("prepare failed: {e}")),
-        };
-        let rows = stmt
-            .query_map(rusqlite::params![q, lim], |row| {
-                let session_id: String = row.get(0)?;
-                let message_index: i64 = row.get(1)?;
-                let content: String = row.get(2)?;
-                let _role: String = row.get(3)?;
-                let timestamp: String = row.get(4)?;
-                let rank: f64 = row.get::<_, f64>(5).unwrap_or(0.0);
-                // bm25() returns a negative number; smaller (more negative)
-                // is better. Map to a (0, 1] relevance via 1 / (1 + |rank|).
-                let relevance = (1.0 / (1.0 + rank.abs())) as f32;
-                Ok(FactReference {
-                    source: FactSource::Session {
-                        session_id,
-                        message_index: message_index as usize,
-                    },
-                    content,
-                    relevance: relevance.clamp(0.0, 1.0),
-                    timestamp: Some(timestamp),
-                })
-            })
-            .map_err(|e| format!("query_map failed: {e}"))?;
-        let mut out: Vec<FactReference> = Vec::new();
-        for fr in rows.flatten() {
-            out.push(fr);
-        }
-        Ok(out)
-    })
-    .await
-    .map_err(|e| ReasoningError::Memory(format!("FTS task join error: {e}")))?;
+    let result = tokio::task::spawn_blocking(move || store.search_sessions_fts(&q, limit, None))
+        .await
+        .map_err(|e| ReasoningError::Memory(format!("FTS task join error: {e}")))?;
 
     match result {
-        Ok(v) => Ok(v),
-        Err(msg) => {
+        Ok(hits) => {
+            let mut out: Vec<FactReference> = Vec::with_capacity(hits.len());
+            for hit in hits {
+                let relevance = (1.0 / (1.0 + hit.score.abs())) as f32;
+                out.push(FactReference {
+                    source: FactSource::Session {
+                        session_id: hit.session_id,
+                        message_index: 0,
+                    },
+                    // Use the snippet (with `<b>` markers) as the surfaced
+                    // content — it's already short and shows the matched
+                    // span in context.
+                    content: hit.snippet,
+                    relevance: relevance.clamp(0.0, 1.0),
+                    timestamp: Some(hit.timestamp),
+                });
+            }
+            Ok(out)
+        }
+        Err(e) => {
             // Bad MATCH syntax or transient SQLite error — log + return
             // empty so the rest of fact retrieval still runs.
-            tracing::warn!(query = %query, "FTS5 session search degraded: {msg}");
+            tracing::warn!(query = %query, "FTS5 session search degraded: {e}");
             Ok(Vec::new())
         }
     }
