@@ -47,6 +47,28 @@ pub enum SkillError {
     SecurityBlocked(String),
     #[error("Skill config error: {0}")]
     Config(#[from] crate::config_injection::SkillConfigError),
+    /// SP-03: skill is in the `protected` set; `skill_manage` mutation
+    /// attempts return this error without touching disk. The `hint`
+    /// carries the unlock instructions surfaced to the agent / user.
+    #[error("Skill '{name}' is protected — {action} blocked. {hint}")]
+    Protected {
+        /// Skill name.
+        name: String,
+        /// What action was attempted (e.g. "patch", "delete").
+        action: String,
+        /// Human-readable unlock instructions.
+        hint: String,
+    },
+    /// SP-03: skill is loaded with `mutable=false`; mutation blocked.
+    #[error("Skill '{name}' is immutable — {action} blocked. {hint}")]
+    Immutable {
+        /// Skill name.
+        name: String,
+        /// What action was attempted.
+        action: String,
+        /// Human-readable hint about how to unlock.
+        hint: String,
+    },
 }
 
 /// The runtime type for a skill.
