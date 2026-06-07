@@ -512,4 +512,152 @@ mod tests {
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // Should not error
     }
+
+    /// Replay v1..v8 in order, then return the connection. Used to seed a
+    /// schema-v8 connection that `migrate_v9` can then advance to v9.
+    fn open_at_v8() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        set_schema_version(&conn, 8).unwrap();
+        conn
+    }
+
+    fn insert_session_row(
+        conn: &Connection,
+        session_id: &str,
+        agent_id: &str,
+        messages_blob: &[u8],
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+            rusqlite::params![session_id, agent_id, messages_blob, updated_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_v8_to_v9_preserves_sessions_and_backfills_fts() {
+        use openfang_types::message::Message;
+
+        let conn = open_at_v8();
+
+        // Two sessions, each with a couple of messages.
+        let msgs_s1 = vec![
+            Message::user("hello world"),
+            Message::assistant("hi! how can I help with rust today?"),
+        ];
+        let msgs_s2 = vec![
+            Message::user("totally different topic"),
+            Message::assistant("noted, switching context"),
+        ];
+        let blob_s1 = rmp_serde::to_vec_named(&msgs_s1).unwrap();
+        let blob_s2 = rmp_serde::to_vec_named(&msgs_s2).unwrap();
+
+        insert_session_row(&conn, "s1", "agent-a", &blob_s1, "2026-06-07T12:00:00Z");
+        insert_session_row(&conn, "s2", "agent-a", &blob_s2, "2026-06-07T12:01:00Z");
+
+        // Capture BLOBs before migration so we can prove byte-equality after.
+        let blob_s1_pre: Vec<u8> = conn
+            .query_row("SELECT messages FROM sessions WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        let blob_s2_pre: Vec<u8> = conn
+            .query_row("SELECT messages FROM sessions WHERE id='s2'", [], |r| r.get(0))
+            .unwrap();
+
+        // Run the migration under test.
+        migrate_v9(&conn).unwrap();
+
+        // session_messages populated.
+        let s1_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s1_count, 2);
+        let s2_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='s2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s2_count, 2);
+
+        // FTS5 MATCH finds backfilled term.
+        let rust_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages_fts WHERE session_messages_fts MATCH 'rust'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rust_hits >= 1, "expected ≥1 FTS hit for 'rust'");
+
+        // Canonical BLOB is byte-identical pre vs post.
+        let blob_s1_post: Vec<u8> = conn
+            .query_row("SELECT messages FROM sessions WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        let blob_s2_post: Vec<u8> = conn
+            .query_row("SELECT messages FROM sessions WHERE id='s2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blob_s1_pre, blob_s1_post);
+        assert_eq!(blob_s2_pre, blob_s2_post);
+    }
+
+    #[test]
+    fn migrate_v8_to_v9_skips_broken_blob() {
+        use openfang_types::message::Message;
+
+        let conn = open_at_v8();
+
+        // s1: valid messages.
+        let msgs_s1 = vec![Message::user("good content here")];
+        let blob_s1 = rmp_serde::to_vec_named(&msgs_s1).unwrap();
+        insert_session_row(&conn, "s1", "agent-a", &blob_s1, "2026-06-07T12:00:00Z");
+
+        // s2: garbage bytes — not a valid msgpack-encoded Vec<Message>.
+        let garbage: Vec<u8> = vec![0xff, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x42];
+        insert_session_row(&conn, "s2", "agent-a", &garbage, "2026-06-07T12:01:00Z");
+
+        // Migration must NOT propagate the per-session decode failure.
+        let result = migrate_v9(&conn);
+        assert!(result.is_ok(), "migrate_v9 must return Ok on broken BLOB");
+
+        // s1 rows present.
+        let s1_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s1_count, 1);
+
+        // s2 rows absent — backfill skipped it.
+        let s2_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='s2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s2_count, 0);
+
+        // Original sessions.messages BLOB for s2 is untouched.
+        let blob_s2_post: Vec<u8> = conn
+            .query_row("SELECT messages FROM sessions WHERE id='s2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blob_s2_post, garbage);
+    }
 }
