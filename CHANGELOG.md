@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Schema v9: FTS5 session search via new `session_messages` flat companion table + external-content FTS5 index. The msgpack BLOB read path in `SessionStore::get_session` is unchanged — the flat table is a search-only companion. Existing v8 user databases auto-upgrade and are best-effort backfilled on first boot.
+- New crate `openfang-reasoning` providing a 5-level reasoning engine (`Minimal`, `Low`, `Medium`, `High`, `Max`), persistent monthly budget tracker, and opt-in user-profile writeback.
+- Built-in tools: `session_search`, `skill_manage`, `memory_reason`, `memory_conclude`. (Tool count increased by 4.)
+- Skill self-patching with a two-tier `protected`/`mutable` defense. Defaults are applied at load time — bundled `skill.toml` files on disk are NOT mutated by a build script.
+- Capability flag `capabilities.allow_skill_mutation` (default `false`; on in `Continuous`/`Proactive` modes) gates `skill_manage` mutations.
+- `[reasoning]` config block with `deny_unknown_fields` — typos in this section now fail loud at startup with a clear error. The loaded reasoning config is logged at INFO with an explicit `(from config)` vs `(DEFAULT — no [reasoning] section)` marker.
+
+### Changed
+
+- Dashboard/API authentication key (`KernelConfig.api_key`) is now stored as `zeroize::Zeroizing<String>` so the secret is wiped from memory when the config drops. Existing TOML configs deserialize unchanged.
+
+### Compatibility
+
+- **Backward compatible.** Existing v8 user databases auto-upgrade to v9 on first boot. Existing sessions are best-effort backfilled into the new flat `session_messages` table; sessions whose msgpack blob fails to decode are logged at WARN and skipped (the migration does not abort). Existing `skill.toml` files parse unchanged — the two new flags (`mutable`, `protected`) are optional with `Option<bool>`. Existing `api_key = "..."` config keys load identically to before — the new `Zeroizing<String>` wrapping is transparent to the on-disk format.
+
 ## [0.5.10] - 2026-04-17
 
 ### Fixed
