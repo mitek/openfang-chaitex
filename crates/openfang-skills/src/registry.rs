@@ -219,6 +219,14 @@ impl SkillRegistry {
                 Ok(converted) => {
                     let mut manifest = converted.manifest;
 
+                    // Plan 01-07 (SP-03): apply bundled-skill load-time
+                    // defaults. mutable defaults to false; protected
+                    // defaults to true only for SYSTEM_SKILLS. Explicit
+                    // values in the bundled skill.toml win — none of the
+                    // 60 bundled manifests set these today, so this is
+                    // effectively the canonical default-applier.
+                    crate::apply_load_time_defaults(&mut manifest, /*is_bundled=*/ true);
+
                     // Inject resolved config block into the prompt if the
                     // frontmatter declared a `config:` section.
                     if let Err(e) = self.apply_skill_config(&mut manifest, &converted.config_vars) {
@@ -369,6 +377,13 @@ impl SkillRegistry {
         let manifest_path = skill_dir.join("skill.toml");
         let toml_str = std::fs::read_to_string(&manifest_path)?;
         let mut manifest: SkillManifest = toml::from_str(&toml_str)?;
+
+        // Plan 01-07 (SP-03): apply user-skill load-time defaults. Disk
+        // is user/workspace/clawhub territory — mutable defaults to true,
+        // protected to false. Explicit values in the on-disk skill.toml
+        // always win (e.g. a user can mark their own skill `protected =
+        // true` and block their own future mutations).
+        crate::apply_load_time_defaults(&mut manifest, /*is_bundled=*/ false);
 
         // Resolve + inject config block if the manifest declared `config:` vars.
         // A hard error here propagates up — a broken/unresolvable required var
@@ -586,15 +601,45 @@ impl SkillRegistry {
     // added by plan 01-06.
     // ----------------------------------------------------------------------
 
-    /// Permission-style stub. Plan 01-07 fills the body that checks the
-    /// effective `mutable` / `protected` flags applied at load time. Until
-    /// then this is a no-op so plan 01-05's mutation methods are wired and
-    /// testable end-to-end.
+    /// SP-03 permission check (plan 01-07).
+    ///
+    /// Looks up the installed skill, reads the effective `protected` /
+    /// `mutable` flags applied by `apply_load_time_defaults` at load
+    /// time, and returns the appropriate structured error if the
+    /// requested action is not allowed.
+    ///
+    /// `protected` is checked first so a protected skill always reports
+    /// `Protected` (not `Immutable`) — the operator who tries to mutate
+    /// `memory-core` should see the protected hint, not the immutable
+    /// one. A skill that doesn't exist returns `NotFound` rather than
+    /// pretending the mutation is allowed.
     pub(crate) fn check_mutable(
         &self,
-        _name: &str,
-        _action: &str,
+        name: &str,
+        action: &str,
     ) -> Result<(), SkillError> {
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+        let protected = skill.manifest.skill.protected.unwrap_or(false);
+        let mutable = skill.manifest.skill.mutable.unwrap_or(false);
+        if protected {
+            return Err(SkillError::Protected {
+                name: name.to_string(),
+                action: action.to_string(),
+                hint: "Set `protected = false` in the skill.toml on disk and reload the agent."
+                    .to_string(),
+            });
+        }
+        if !mutable {
+            return Err(SkillError::Immutable {
+                name: name.to_string(),
+                action: action.to_string(),
+                hint: "Set `mutable = true` in the skill.toml on disk and reload the agent."
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -745,7 +790,10 @@ impl SkillRegistry {
         prompt_context: Option<&str>,
         _category: Option<&str>,
     ) -> Result<String, SkillError> {
-        self.check_mutable(name, "create")?;
+        // Plan 01-07 explicitly exempts `create_skill` from `check_mutable`
+        // — the skill does not exist yet, so there's nothing to check
+        // mutability against. The duplicate check below handles the
+        // already-installed case.
         if self.skills.contains_key(name) {
             return Err(SkillError::AlreadyInstalled(name.to_string()));
         }
@@ -1773,5 +1821,318 @@ input_schema = { type = "object" }
             "2.0.0",
             "Workspace version should be active"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Plan 01-07 — protected/mutable defaults + check_mutable enforcement
+    // ──────────────────────────────────────────────────────────────────
+
+    fn sha256_file(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("file must be readable for hashing");
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    /// Pick one bundled SYSTEM_SKILLS entry that actually exists in the
+    /// bundled set. `memory-core` is the canonical one used in design docs.
+    fn pick_bundled_system_skill_name(reg: &SkillRegistry) -> Option<String> {
+        for name in crate::SYSTEM_SKILLS {
+            if reg.get(name).is_some() {
+                return Some((*name).to_string());
+            }
+        }
+        None
+    }
+
+    /// Pick any bundled skill whose name is NOT in SYSTEM_SKILLS.
+    fn pick_bundled_non_system_skill_name(reg: &SkillRegistry) -> Option<String> {
+        for skill in reg.list_all() {
+            let name = &skill.manifest.skill.name;
+            if !crate::is_system_skill(name) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn bundled_system_skill_loads_protected() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        reg.load_bundled();
+        let Some(name) = pick_bundled_system_skill_name(&reg) else {
+            // No SYSTEM_SKILL is currently bundled in this build (e.g. all
+            // bundled set is non-system). Skip the assertion — the helper
+            // contract is "if present, must be protected".
+            return;
+        };
+        let skill = reg.get(&name).expect("SYSTEM_SKILLS member must be loaded");
+        assert_eq!(
+            skill.manifest.skill.protected,
+            Some(true),
+            "SYSTEM_SKILLS member '{name}' must default protected=true"
+        );
+        assert_eq!(
+            skill.manifest.skill.mutable,
+            Some(false),
+            "SYSTEM_SKILLS member '{name}' must default mutable=false"
+        );
+    }
+
+    #[test]
+    fn bundled_non_system_skill_loads_immutable_not_protected() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        reg.load_bundled();
+        let Some(name) = pick_bundled_non_system_skill_name(&reg) else {
+            return; // bundled set is empty or all-system
+        };
+        let skill = reg.get(&name).expect("non-system bundled skill must be loaded");
+        assert_eq!(
+            skill.manifest.skill.protected,
+            Some(false),
+            "non-system bundled '{name}' must default protected=false"
+        );
+        assert_eq!(
+            skill.manifest.skill.mutable,
+            Some(false),
+            "non-system bundled '{name}' must default mutable=false"
+        );
+    }
+
+    #[test]
+    fn patch_protected_skill_returns_protected_error_no_disk_write() {
+        // Build a synthetic protected skill on disk so the test doesn't
+        // depend on which SYSTEM_SKILLS happen to be bundled. We craft a
+        // user-skill whose name IS in SYSTEM_SKILLS and load it via
+        // load_skill — apply_load_time_defaults will mark it
+        // protected=true because of the name. Actually that path goes
+        // through is_bundled=false, which always sets protected=false.
+        // So instead: craft a skill TOML that explicitly says
+        // `protected = true` so check_mutable triggers.
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        let toml = r#"
+[skill]
+name = "locked-down"
+version = "0.1.0"
+description = "protected"
+protected = true
+mutable = false
+
+[runtime]
+type = "promptonly"
+
+[[tools.provided]]
+name = "lockdown_tool"
+description = "tool"
+input_schema = { type = "object" }
+"#;
+        reg.create_skill("locked-down", toml, None, None)
+            .expect("create_skill is exempt from check_mutable and must succeed");
+        // SHA256 pre-mutation.
+        let toml_path = reg.skills_dir.join("locked-down").join("skill.toml");
+        let pre = sha256_file(&toml_path);
+        // Patch attempt.
+        let err = reg
+            .patch_skill("locked-down", "protected", "rewritten", false)
+            .unwrap_err();
+        match err {
+            SkillError::Protected {
+                name,
+                action,
+                hint,
+            } => {
+                assert_eq!(name, "locked-down");
+                assert_eq!(action, "patch");
+                assert!(hint.contains("protected = false"), "hint: {hint}");
+            }
+            other => panic!("expected Protected, got {other:?}"),
+        }
+        // File on disk byte-identical.
+        let post = sha256_file(&toml_path);
+        assert_eq!(pre, post, "disk file changed despite Protected error");
+    }
+
+    #[test]
+    fn patch_immutable_skill_returns_immutable_error_no_disk_write() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        let toml = r#"
+[skill]
+name = "frozen"
+version = "0.1.0"
+description = "immutable"
+protected = false
+mutable = false
+
+[runtime]
+type = "promptonly"
+
+[[tools.provided]]
+name = "frozen_tool"
+description = "tool"
+input_schema = { type = "object" }
+"#;
+        reg.create_skill("frozen", toml, None, None).unwrap();
+        let toml_path = reg.skills_dir.join("frozen").join("skill.toml");
+        let pre = sha256_file(&toml_path);
+        let err = reg
+            .patch_skill("frozen", "immutable", "rewritten", false)
+            .unwrap_err();
+        match err {
+            SkillError::Immutable {
+                name,
+                action,
+                hint,
+            } => {
+                assert_eq!(name, "frozen");
+                assert_eq!(action, "patch");
+                assert!(hint.contains("mutable = true"), "hint: {hint}");
+            }
+            other => panic!("expected Immutable, got {other:?}"),
+        }
+        let post = sha256_file(&toml_path);
+        assert_eq!(pre, post, "disk file changed despite Immutable error");
+    }
+
+    #[test]
+    fn patch_user_skill_succeeds_after_create_skill() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        // No explicit mutable/protected — create_skill stamps mutable=true.
+        let toml = skill_toml("user-x", "original");
+        reg.create_skill("user-x", &toml, None, None).unwrap();
+        reg.patch_skill("user-x", "original", "updated", false)
+            .expect("user-created skills must be patchable");
+        let on_disk =
+            std::fs::read_to_string(reg.skills_dir.join("user-x").join("skill.toml")).unwrap();
+        assert!(on_disk.contains("updated"));
+    }
+
+    #[test]
+    fn protected_field_in_user_skill_toml_honored() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = SkillRegistry::new(dir.path().to_path_buf());
+        let toml = r#"
+[skill]
+name = "self-locked"
+version = "0.1.0"
+description = "user opts in"
+protected = true
+mutable = true
+
+[runtime]
+type = "promptonly"
+
+[[tools.provided]]
+name = "self_lock_tool"
+description = "tool"
+input_schema = { type = "object" }
+"#;
+        // create_skill is exempt; user can create their own protected skill.
+        reg.create_skill("self-locked", toml, None, None).unwrap();
+        // patch must now fail with Protected (protected wins over mutable).
+        let err = reg
+            .patch_skill("self-locked", "anything", "x", false)
+            .unwrap_err();
+        assert!(
+            matches!(err, SkillError::Protected { ref name, .. } if name == "self-locked"),
+            "expected Protected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_mutable_unknown_skill_returns_not_found() {
+        let dir = TempDir::new().unwrap();
+        let reg = SkillRegistry::new(dir.path().to_path_buf());
+        let err = reg.check_mutable("nope", "patch").unwrap_err();
+        assert!(matches!(err, SkillError::NotFound(name) if name == "nope"));
+    }
+
+    #[test]
+    fn apply_load_time_defaults_pure_mapping() {
+        use crate::{SkillMeta, SkillRequirements, SkillRuntimeConfig, SkillTools};
+
+        // Bundled SYSTEM
+        let mut m = SkillManifest {
+            skill: SkillMeta {
+                name: "memory-core".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                author: String::new(),
+                license: String::new(),
+                tags: Vec::new(),
+                mutable: None,
+                protected: None,
+            },
+            runtime: SkillRuntimeConfig::default(),
+            tools: SkillTools::default(),
+            requirements: SkillRequirements::default(),
+            prompt_context: None,
+            source: None,
+            config: std::collections::HashMap::new(),
+        };
+        crate::apply_load_time_defaults(&mut m, true);
+        assert_eq!(m.skill.mutable, Some(false));
+        assert_eq!(m.skill.protected, Some(true));
+
+        // Bundled non-SYSTEM
+        let mut m = SkillManifest {
+            skill: SkillMeta {
+                name: "pdf-reader".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                author: String::new(),
+                license: String::new(),
+                tags: Vec::new(),
+                mutable: None,
+                protected: None,
+            },
+            ..m
+        };
+        crate::apply_load_time_defaults(&mut m, true);
+        assert_eq!(m.skill.mutable, Some(false));
+        assert_eq!(m.skill.protected, Some(false));
+
+        // User skill (is_bundled=false) — even SYSTEM_SKILLS names get
+        // user defaults because the bundled-vs-user dispatch is the
+        // caller's choice (see helper doc-comment).
+        let mut m = SkillManifest {
+            skill: SkillMeta {
+                name: "memory-core".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                author: String::new(),
+                license: String::new(),
+                tags: Vec::new(),
+                mutable: None,
+                protected: None,
+            },
+            ..m
+        };
+        crate::apply_load_time_defaults(&mut m, false);
+        assert_eq!(m.skill.mutable, Some(true));
+        assert_eq!(m.skill.protected, Some(false));
+
+        // Explicit values always win.
+        let mut m = SkillManifest {
+            skill: SkillMeta {
+                name: "x".to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                author: String::new(),
+                license: String::new(),
+                tags: Vec::new(),
+                mutable: Some(true),
+                protected: Some(true),
+            },
+            ..m
+        };
+        crate::apply_load_time_defaults(&mut m, true);
+        assert_eq!(m.skill.mutable, Some(true));
+        assert_eq!(m.skill.protected, Some(true));
     }
 }

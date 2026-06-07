@@ -20,6 +20,66 @@ pub mod verify;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Names of system-critical skills (SP-03).
+///
+/// These ship bundled and are loaded with `protected = true` by default in
+/// `SkillRegistry::load_bundled` (plan 01-07), which makes any
+/// `skill_manage` mutation attempt (`patch`, `edit`, `delete`,
+/// `write_skill_file`, `reload_skill`, `set_skill_enabled`) return a
+/// `SkillError::Protected` without touching disk.
+///
+/// The set is intentionally narrow — it covers skills the agent loop or
+/// kernel relies on at boot. A user who explicitly wants to mutate one
+/// edits the on-disk `skill.toml` to set `protected = false` and reloads.
+pub const SYSTEM_SKILLS: &[&str] = &[
+    "skill-manage",
+    "tool-dispatch",
+    "memory-core",
+    "memory-reason",
+    "session-manager",
+    "session-search",
+    "event-bus",
+    "kernel-api",
+    "security-scanner",
+    "prompt-injection",
+];
+
+/// Whether a skill name is in the SYSTEM_SKILLS set. Tiny helper kept here
+/// so the constant and its predicate stay together (refactor safety).
+pub fn is_system_skill(name: &str) -> bool {
+    SYSTEM_SKILLS.contains(&name)
+}
+
+/// Apply load-time defaults for `mutable` / `protected` per SP-03 (plan 01-07).
+///
+/// Explicit values in the parsed manifest always win — the defaults only fill
+/// `None`. Bundled skills default to `mutable=false`; SYSTEM_SKILLS additionally
+/// default to `protected=true`; everything else (user / workspace / clawhub
+/// loads) defaults to `mutable=true, protected=false`.
+///
+/// The bundled-vs-user dispatch is the *caller's* choice — `load_bundled`
+/// passes `is_bundled=true`, `load_skill` / `load_workspace_skills` pass
+/// `false`. This keeps the helper a pure mapping with no I/O or hidden
+/// state, easy to test and easy to audit.
+pub fn apply_load_time_defaults(manifest: &mut SkillManifest, is_bundled: bool) {
+    let name = manifest.skill.name.clone();
+    if is_bundled {
+        if manifest.skill.mutable.is_none() {
+            manifest.skill.mutable = Some(false);
+        }
+        if manifest.skill.protected.is_none() {
+            manifest.skill.protected = Some(is_system_skill(&name));
+        }
+    } else {
+        if manifest.skill.mutable.is_none() {
+            manifest.skill.mutable = Some(true);
+        }
+        if manifest.skill.protected.is_none() {
+            manifest.skill.protected = Some(false);
+        }
+    }
+}
+
 /// Errors from the skill system.
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
