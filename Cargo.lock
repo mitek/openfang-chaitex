@@ -4253,6 +4253,7 @@ dependencies = [
  "hex",
  "http",
  "openfang-memory",
+ "openfang-reasoning",
  "openfang-skills",
  "openfang-types",
  "regex-lite",

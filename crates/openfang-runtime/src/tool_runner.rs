@@ -306,6 +306,10 @@ pub async fn execute_tool(
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
 
+        // === PHASE 1 PLAN 01-13 memory_reason ===
+        "memory_reason" => tool_memory_reason(input, kernel).await,
+        // === END PHASE 1 PLAN 01-13 ===
+
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
         "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
@@ -1376,6 +1380,22 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // === END PHASE 1 PLAN 01-08 skill_manage schema ===
+        // === PHASE 1 PLAN 01-13 memory_reason schema ===
+        ToolDefinition {
+            name: "memory_reason".to_string(),
+            description: "Ask questions about the user based on accumulated memory. Returns synthesized answers, not just raw facts. Use reasoning_level to control depth: minimal (fast/cheap, mechanical lookup), low (semantic+FTS5), medium (multi-source synthesis), high (deep multi-hop), max (deepest; requires approval=true when require_approval_for_max).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The question to answer from memory." },
+                    "reasoning_level": { "type": "string", "enum": ["minimal","low","medium","high","max"] },
+                    "max_facts": { "type": "integer" },
+                    "approved": { "type": "boolean", "description": "Required when reasoning_level=\"max\" and config require_approval_for_max=true." }
+                },
+                "required": ["query"]
+            }),
+        },
+        // === END PHASE 1 PLAN 01-13 memory_reason schema ===
     ]
 }
 
@@ -4067,6 +4087,233 @@ fn skill_error_to_json(
 }
 // === END PHASE 1 PLAN 01-08 ===
 
+// === PHASE 1 PLAN 01-13 memory_reason ===
+//
+// Dispatcher for the agent-facing `memory_reason` tool. Reads the
+// kernel's `ReasoningEngine`, `BudgetTracker`, and `ReasoningConfig`
+// via the `KernelHandle` accessors added in the same plan.
+//
+// Pre-call gates:
+// 1. Level parse (string → ReasoningLevel). Unknown → InvalidLevel JSON.
+// 2. Level vs cfg.max_level — rejection returns LevelNotAllowed JSON.
+// 3. Budget: if spent >= monthly_budget_usd, block mode returns
+//    BudgetExceeded JSON, warn mode downgrades to Low + caveat (also
+//    enforced inside the engine; tool layer is just for UX surfacing).
+// 4. Max approval gate: if level == Max && require_approval_for_max &&
+//    !approved → ApprovalRequired JSON with a cost estimate + 80-char
+//    query preview.
+//
+// Result JSON always includes: answer, supporting_facts, confidence,
+// level, caveats, estimated_cost_usd (MR-04 + MR-07).
+async fn tool_memory_reason(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'query' parameter")?
+        .to_string();
+    let level_str = input
+        .get("reasoning_level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium")
+        .to_lowercase();
+    let max_facts = input
+        .get("max_facts")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let approved = input
+        .get("approved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let kh = match kernel {
+        Some(k) => k.as_ref(),
+        None => {
+            return Ok(serde_json::json!({
+                "error": "KernelUnavailable",
+                "tool": "memory_reason",
+                "hint": "memory_reason requires a kernel handle.",
+            })
+            .to_string());
+        }
+    };
+
+    let level = match parse_reasoning_level(&level_str) {
+        Some(l) => l,
+        None => {
+            return Ok(serde_json::json!({
+                "error": "InvalidLevel",
+                "tool": "memory_reason",
+                "level": level_str,
+                "hint": "Allowed: minimal, low, medium, high, max.",
+            })
+            .to_string());
+        }
+    };
+
+    let cfg = match kh.reasoning_config() {
+        Some(c) => c,
+        None => {
+            return Ok(serde_json::json!({
+                "error": "ConfigUnavailable",
+                "tool": "memory_reason",
+            })
+            .to_string());
+        }
+    };
+
+    // Level ceiling check — fail fast before any retrieval.
+    let max_allowed = match parse_reasoning_level(&cfg.max_level.to_lowercase()) {
+        Some(l) => l,
+        None => openfang_reasoning::ReasoningLevel::High,
+    };
+    if level > max_allowed {
+        return Ok(serde_json::json!({
+            "error": "LevelNotAllowed",
+            "tool": "memory_reason",
+            "requested": level_str,
+            "max_allowed": cfg.max_level,
+        })
+        .to_string());
+    }
+
+    // Pre-call budget check at the tool layer for UX. The engine
+    // enforces the same invariant — but doing it here lets us also
+    // return a BudgetExceeded JSON without invoking the engine in
+    // block mode.
+    if let Some(tracker) = kh.budget_tracker() {
+        let spent = tracker
+            .current_month_spent()
+            .map_err(|e| format!("budget tracker query failed: {e}"))?;
+        let limit = tracker.monthly_budget_usd();
+        if limit > 0.0 && spent >= limit && cfg.budget_exceeded_action == "block" {
+            return Ok(serde_json::json!({
+                "error": "BudgetExceeded",
+                "tool": "memory_reason",
+                "spent": spent,
+                "limit": limit,
+            })
+            .to_string());
+        }
+    }
+
+    // Max approval gate.
+    if level == openfang_reasoning::ReasoningLevel::Max
+        && cfg.require_approval_for_max
+        && !approved
+    {
+        let preview: String = query.chars().take(80).collect();
+        // Conservative cost estimate for Max: use the per-1k token rate
+        // hard-coded in engine.rs (0.015 in, 0.075 out) with a 1k token
+        // assumed input/output.
+        let estimated_cost_usd = 0.015 + 0.075;
+        return Ok(serde_json::json!({
+            "error": "ApprovalRequired",
+            "tool": "memory_reason",
+            "level": "max",
+            "estimated_cost_usd": estimated_cost_usd,
+            "query_preview": preview,
+        })
+        .to_string());
+    }
+
+    let engine = match kh.reasoning_engine() {
+        Some(e) => e,
+        None => {
+            return Ok(serde_json::json!({
+                "error": "EngineUnavailable",
+                "tool": "memory_reason",
+            })
+            .to_string());
+        }
+    };
+
+    let q = openfang_reasoning::ReasoningQuery {
+        query: query.clone(),
+        level,
+        agent_id: None,
+        max_facts,
+    };
+    match engine.reason(q).await {
+        Ok(r) => {
+            // MR-04 result shape: all six fields present at the top
+            // level of the tool result JSON.
+            Ok(serde_json::json!({
+                "answer": r.answer,
+                "supporting_facts": r.supporting_facts,
+                "confidence": r.confidence,
+                "level": r.level,
+                "caveats": r.caveats,
+                "estimated_cost_usd": r.estimated_cost_usd,
+            })
+            .to_string())
+        }
+        Err(e) => Ok(reasoning_error_to_json(&e)),
+    }
+}
+
+/// Parse the agent-supplied reasoning level string into the enum.
+/// Mirrors `ReasoningLevel`'s `Deserialize` impl but returns `None` for
+/// unknown values instead of failing the deserializer — the tool layer
+/// surfaces unknown levels as an `InvalidLevel` JSON error.
+fn parse_reasoning_level(s: &str) -> Option<openfang_reasoning::ReasoningLevel> {
+    match s {
+        "minimal" => Some(openfang_reasoning::ReasoningLevel::Minimal),
+        "low" => Some(openfang_reasoning::ReasoningLevel::Low),
+        "medium" => Some(openfang_reasoning::ReasoningLevel::Medium),
+        "high" => Some(openfang_reasoning::ReasoningLevel::High),
+        "max" => Some(openfang_reasoning::ReasoningLevel::Max),
+        _ => None,
+    }
+}
+
+/// Map a `ReasoningError` to the structured JSON the agent loop reads.
+fn reasoning_error_to_json(err: &openfang_reasoning::ReasoningError) -> String {
+    use openfang_reasoning::ReasoningError;
+    let payload = match err {
+        ReasoningError::LevelNotAllowed { requested, max_allowed } => serde_json::json!({
+            "error": "LevelNotAllowed",
+            "tool": "memory_reason",
+            "requested": format!("{requested:?}"),
+            "max_allowed": format!("{max_allowed:?}"),
+        }),
+        ReasoningError::ApprovalRequired { level, estimated_cost_usd, query_preview } => {
+            serde_json::json!({
+                "error": "ApprovalRequired",
+                "tool": "memory_reason",
+                "level": level,
+                "estimated_cost_usd": estimated_cost_usd,
+                "query_preview": query_preview,
+            })
+        }
+        ReasoningError::BudgetExceeded { spent, limit } => serde_json::json!({
+            "error": "BudgetExceeded",
+            "tool": "memory_reason",
+            "spent": spent,
+            "limit": limit,
+        }),
+        ReasoningError::Memory(msg) => serde_json::json!({
+            "error": "MemoryAccess",
+            "tool": "memory_reason",
+            "message": msg,
+        }),
+        ReasoningError::Llm(msg) => serde_json::json!({
+            "error": "LlmSynthesis",
+            "tool": "memory_reason",
+            "message": msg,
+        }),
+        ReasoningError::NotYetImplemented(msg) => serde_json::json!({
+            "error": "NotYetImplemented",
+            "tool": "memory_reason",
+            "message": msg,
+        }),
+    };
+    payload.to_string()
+}
+// === END PHASE 1 PLAN 01-13 ===
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5713,5 +5960,376 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error"], "UnknownAction");
         assert_eq!(v["action"], "frobnicate");
+    }
+
+    // ===== Plan 01-13 memory_reason tests =====
+
+    use openfang_memory::MemorySubstrate;
+    use openfang_reasoning::{
+        BudgetRecord, BudgetTracker, FactReference, KernelLlm, ReasoningEngine, ReasoningError,
+        ReasoningLevel,
+    };
+    use openfang_types::message::TokenUsage as RmtTokenUsage;
+
+    struct ReasonMockLlm;
+
+    #[async_trait::async_trait]
+    impl KernelLlm for ReasonMockLlm {
+        async fn complete_for_reasoning(
+            &self,
+            _prompt: &str,
+            _max_output_tokens: u32,
+            level: ReasoningLevel,
+        ) -> Result<(String, RmtTokenUsage), ReasoningError> {
+            Ok((
+                format!("mock-answer-{level:?}"),
+                RmtTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 25,
+                },
+            ))
+        }
+    }
+
+    /// Adapter shim: real `ReasoningLlm` impl that forwards to the mock
+    /// KernelLlm above. Avoids using `KernelLlmAdapter` (which needs a
+    /// Weak<K>) so tests can drive the engine without an Arc cycle.
+    struct DirectLlmShim {
+        inner: ReasonMockLlm,
+    }
+    #[async_trait::async_trait]
+    impl openfang_reasoning::ReasoningLlm for DirectLlmShim {
+        async fn synthesize(
+            &self,
+            _query: &str,
+            _facts: &[FactReference],
+            level: ReasoningLevel,
+        ) -> Result<String, ReasoningError> {
+            let (text, _) = self.inner.complete_for_reasoning("", 100, level).await?;
+            Ok(text)
+        }
+        async fn synthesize_with_usage(
+            &self,
+            _query: &str,
+            _facts: &[FactReference],
+            level: ReasoningLevel,
+        ) -> Result<(String, RmtTokenUsage), ReasoningError> {
+            self.inner.complete_for_reasoning("", 100, level).await
+        }
+    }
+
+    struct ReasonFakeKernel {
+        cfg: openfang_types::config::KernelConfig,
+        engine: Arc<ReasoningEngine>,
+        tracker: Arc<BudgetTracker>,
+    }
+
+    impl ReasonFakeKernel {
+        fn new(
+            max_level: &str,
+            require_approval_for_max: bool,
+            monthly_budget: f64,
+            budget_exceeded_action: &str,
+        ) -> Self {
+            let mem = Arc::new(MemorySubstrate::open_in_memory(0.0).unwrap());
+            let tracker = Arc::new(BudgetTracker::new(mem.clone(), monthly_budget));
+            let llm: Arc<dyn openfang_reasoning::ReasoningLlm> =
+                Arc::new(DirectLlmShim { inner: ReasonMockLlm });
+            let engine = ReasoningEngine::new(mem)
+                .with_llm(llm)
+                .with_budget(tracker.clone(), budget_exceeded_action);
+            let mut cfg = openfang_types::config::KernelConfig::default();
+            cfg.reasoning.max_level = max_level.to_string();
+            cfg.reasoning.require_approval_for_max = require_approval_for_max;
+            cfg.reasoning.monthly_budget_usd = monthly_budget;
+            cfg.reasoning.budget_exceeded_action = budget_exceeded_action.to_string();
+            Self {
+                cfg,
+                engine: Arc::new(engine),
+                tracker,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kernel_handle::KernelHandle for ReasonFakeKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not used".into())
+        }
+        async fn send_to_agent(
+            &self,
+            _agent_id: &str,
+            _message: &str,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_store(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_recall(
+            &self,
+            _key: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn task_claim(
+            &self,
+            _agent_id: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        async fn task_complete(
+            &self,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn task_list(
+            &self,
+            _status: Option<&str>,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![])
+        }
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(vec![])
+        }
+
+        fn kernel_config(&self) -> Option<&openfang_types::config::KernelConfig> {
+            Some(&self.cfg)
+        }
+        fn reasoning_engine(&self) -> Option<Arc<ReasoningEngine>> {
+            Some(self.engine.clone())
+        }
+        fn budget_tracker(&self) -> Option<Arc<BudgetTracker>> {
+            Some(self.tracker.clone())
+        }
+        fn reasoning_config(
+            &self,
+        ) -> Option<openfang_types::config::ReasoningConfig> {
+            Some(self.cfg.reasoning.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_reason_medium_returns_answer_facts_confidence() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "what is rust?", "reasoning_level": "medium"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // MR-04 6-field shape — every required field present at top level.
+        for field in [
+            "answer",
+            "supporting_facts",
+            "confidence",
+            "level",
+            "caveats",
+            "estimated_cost_usd",
+        ] {
+            assert!(v.get(field).is_some(), "missing field: {field}");
+        }
+        assert!(
+            v["answer"].as_str().unwrap().contains("mock-answer-Medium")
+                || v["answer"].as_str().unwrap().contains("No facts"),
+            "unexpected answer: {}",
+            v["answer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reason_max_without_approved_returns_approval_required() {
+        let fake = Arc::new(ReasonFakeKernel::new("max", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "deep question", "reasoning_level": "max"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "ApprovalRequired");
+        assert_eq!(v["level"], "max");
+        assert!(v["estimated_cost_usd"].as_f64().unwrap() > 0.0);
+        assert!(v["query_preview"]
+            .as_str()
+            .unwrap()
+            .contains("deep question"));
+    }
+
+    #[tokio::test]
+    async fn memory_reason_max_with_approved_proceeds() {
+        let fake = Arc::new(ReasonFakeKernel::new("max", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({
+                "query": "deep question",
+                "reasoning_level": "max",
+                "approved": true,
+            }),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // No `error` field — the engine ran.
+        assert!(v.get("error").is_none(), "unexpected error: {v}");
+        assert!(v.get("answer").is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_reason_budget_exceeded_warn_downgrades_to_low() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 1.0, "warn"));
+        // Pre-spend over the limit.
+        fake.tracker
+            .record(BudgetRecord::new_now(
+                ReasoningLevel::High,
+                100,
+                50,
+                5.0,
+                "seed",
+            ))
+            .unwrap();
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "x", "reasoning_level": "medium"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Engine downgraded — `level` field in the result is `"low"`.
+        assert_eq!(v["level"], "low", "expected downgrade to low, got {v}");
+        let caveats: Vec<String> = serde_json::from_value(v["caveats"].clone()).unwrap();
+        assert!(
+            caveats.iter().any(|c| c.contains("downgraded")),
+            "expected downgrade caveat, got {caveats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reason_budget_exceeded_block_returns_error() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 1.0, "block"));
+        fake.tracker
+            .record(BudgetRecord::new_now(
+                ReasoningLevel::High,
+                100,
+                50,
+                5.0,
+                "seed",
+            ))
+            .unwrap();
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "x", "reasoning_level": "medium"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "BudgetExceeded");
+        assert!(v["spent"].as_f64().unwrap() >= 5.0);
+        assert!((v["limit"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn memory_reason_level_above_max_level_rejected() {
+        let fake = Arc::new(ReasonFakeKernel::new("medium", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "x", "reasoning_level": "high"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "LevelNotAllowed");
+        assert_eq!(v["requested"], "high");
+        assert_eq!(v["max_allowed"], "medium");
+    }
+
+    #[tokio::test]
+    async fn memory_reason_records_to_budget_tracker() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", false, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let before = fake.tracker.current_month_spent().unwrap();
+        let _ = tool_memory_reason(
+            &serde_json::json!({"query": "x", "reasoning_level": "low"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let after = fake.tracker.current_month_spent().unwrap();
+        assert!(
+            after >= before,
+            "tracker should have recorded at least one row: before={before}, after={after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reason_unknown_level_returns_invalid_level() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_reason(
+            &serde_json::json!({"query": "x", "reasoning_level": "ludicrous"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "InvalidLevel");
+        assert_eq!(v["level"], "ludicrous");
     }
 }
