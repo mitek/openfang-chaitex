@@ -14,8 +14,12 @@
 //! - Reasoning levels are totally ordered (`Minimal < Low < Medium < High <
 //!   Max`); ordering is preserved by `derive(PartialOrd, Ord)`.
 
+pub mod budget;
 pub mod error;
 
+pub use budget::{
+    format_effective_log, log_effective_reasoning_config, BudgetRecord, BudgetTracker,
+};
 pub use error::ReasoningError;
 
 use openfang_types::agent::AgentId;

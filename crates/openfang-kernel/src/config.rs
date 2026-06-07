@@ -79,6 +79,13 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
                     match root_value.try_into::<KernelConfig>() {
                         Ok(config) => {
                             info!(path = %config_path.display(), "Loaded configuration");
+                            // Plan 01-12: emit the effective [reasoning] block
+                            // with the (from config) vs (DEFAULT) marker per
+                            // addendum § C.2.
+                            openfang_reasoning::log_effective_reasoning_config(
+                                &config.reasoning,
+                                &config_path,
+                            );
                             return config;
                         }
                         Err(e) => {
@@ -120,7 +127,13 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
         );
     }
 
-    KernelConfig::default()
+    // Fall-through path: either the file was missing, unreadable, unparseable,
+    // or deserialization failed. The returned KernelConfig::default() carries
+    // a ReasoningConfig with is_default_loaded=true, so the marker will
+    // correctly say (DEFAULT).
+    let cfg = KernelConfig::default();
+    openfang_reasoning::log_effective_reasoning_config(&cfg.reasoning, &config_path);
+    cfg
 }
 
 /// Resolve config includes by deep-merging included files into the root value.

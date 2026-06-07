@@ -16,6 +16,10 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+# rusqlite: BudgetTracker speaks SQL against the shared MemorySubstrate
+# connection (the `reasoning_budget` table created in v9, plan 01-12). Same
+# feature set as the rest of the workspace so the bundled SQLite is used.
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
