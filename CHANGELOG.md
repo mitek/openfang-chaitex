@@ -14,11 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in tools: `session_search`, `skill_manage`, `memory_reason`, `memory_conclude`. (Tool count increased by 4.)
 - Skill self-patching with a two-tier `protected`/`mutable` defense. Defaults are applied at load time — bundled `skill.toml` files on disk are NOT mutated by a build script.
 - Capability flag `capabilities.allow_skill_mutation` (default `false`; on in `Continuous`/`Proactive` modes) gates `skill_manage` mutations.
-- `[reasoning]` config block with `deny_unknown_fields` — typos in this section now fail loud at startup with a clear error. The loaded reasoning config is logged at INFO with an explicit `(from config)` vs `(DEFAULT — no [reasoning] section)` marker.
+- `[reasoning]` config block with `deny_unknown_fields` — typos in this section are now detected by serde. The loaded reasoning config is logged at INFO with an explicit `(from config)` vs `(DEFAULT — no [reasoning] section)` marker.
+- **Loud-degrade config policy** (closes long-standing `GAP-012-Tier-2` footgun). `crates/openfang-kernel/src/config.rs` adds `ConfigStatus::{Ok, Degraded}` and `load_config_with_status(...) -> LoadResult`. When a config file is present but fails to read/parse/deserialize, the kernel emits an **ERROR-level** log + stderr banner, populates `kernel.config_status = Degraded`, and continues on `KernelConfig::default()`. Status is surfaced on `GET /api/health` (`config_status: "ok" | "degraded"`) and `GET /api/health/detail` (full error + source path). Missing config file = `Ok` (defaults are intentional). The legacy `load_config(...) -> KernelConfig` shim still exists for backward compatibility.
 
 ### Changed
 
 - Dashboard/API authentication key (`KernelConfig.api_key`) is now stored as `zeroize::Zeroizing<String>` so the secret is wiped from memory when the config drops. Existing TOML configs deserialize unchanged.
+- `GET /api/health` response gains a `config_status` field (`"ok" | "degraded"`). `GET /api/health/detail` additionally returns `config_error` and `config_source` when degraded. Existing fields unchanged.
 
 ### Compatibility
 

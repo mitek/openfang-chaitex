@@ -3485,9 +3485,18 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     let status = if db_ok { "ok" } else { "degraded" };
 
+    // GAP-012-Tier-2 loud-degrade: surface a broken config so the silent-default
+    // path can't hide. Public endpoint shows only "ok|degraded" + a hint to
+    // /api/health/detail for the full error string (info-leak guard).
+    let config_status = match &state.kernel.config_status {
+        openfang_kernel::config::ConfigStatus::Ok => "ok",
+        openfang_kernel::config::ConfigStatus::Degraded { .. } => "degraded",
+    };
+
     Json(serde_json::json!({
         "status": status,
         "version": env!("CARGO_PKG_VERSION"),
+        "config_status": config_status,
     }))
 }
 
@@ -3508,6 +3517,17 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let config_warnings = state.kernel.config.validate();
     let status = if db_ok { "ok" } else { "degraded" };
 
+    // GAP-012-Tier-2 loud-degrade: auth'd endpoint exposes the full parse error
+    // so the operator can fix the typo without grepping logs.
+    let (config_status, config_error, config_source) = match &state.kernel.config_status {
+        openfang_kernel::config::ConfigStatus::Ok => ("ok", serde_json::Value::Null, serde_json::Value::Null),
+        openfang_kernel::config::ConfigStatus::Degraded { source, error } => (
+            "degraded",
+            serde_json::Value::String(error.clone()),
+            serde_json::Value::String(source.clone()),
+        ),
+    };
+
     Json(serde_json::json!({
         "status": status,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3517,6 +3537,9 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "agent_count": state.kernel.registry.count(),
         "database": if db_ok { "connected" } else { "error" },
         "config_warnings": config_warnings,
+        "config_status": config_status,
+        "config_error": config_error,
+        "config_source": config_source,
     }))
 }
 

@@ -3,7 +3,6 @@
 use crate::auth::AuthManager;
 use crate::background::{self, BackgroundExecutor};
 use crate::capabilities::CapabilityManager;
-use crate::config::load_config;
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::metering::MeteringEngine;
@@ -60,6 +59,9 @@ impl LlmDriver for StubDriver {
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
+    /// Whether the loaded config reflects the user's file or fell back to defaults.
+    /// Surfaced on `/api/health` (GAP-012-Tier-2 loud-degrade — see config::load_config_with_status).
+    pub config_status: crate::config::ConfigStatus,
     /// Agent registry.
     pub registry: AgentRegistry,
     /// Capability manager.
@@ -572,8 +574,10 @@ fn gethostname() -> Option<String> {
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
-        let config = load_config(config_path);
-        Self::boot_with_config(config)
+        let load = crate::config::load_config_with_status(config_path);
+        let mut kernel = Self::boot_with_config(load.config)?;
+        kernel.config_status = load.status;
+        Ok(kernel)
     }
 
     /// Fetch live Copilot models by exchanging the persisted token and querying the API.
@@ -1194,6 +1198,9 @@ impl OpenFangKernel {
 
         let kernel = Self {
             config,
+            // Direct boot_with_config bypasses file load — defaults to Ok.
+            // boot() overrides this with the real load status after construction.
+            config_status: crate::config::ConfigStatus::Ok,
             registry: AgentRegistry::new(),
             capabilities: CapabilityManager::new(),
             event_bus: EventBus::new(),

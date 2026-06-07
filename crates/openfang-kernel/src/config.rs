@@ -6,19 +6,60 @@
 use openfang_types::config::KernelConfig;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{error, info};
 
 /// Maximum include nesting depth.
 const MAX_INCLUDE_DEPTH: u32 = 10;
 
-/// Load kernel configuration from a TOML file, with defaults.
+/// Whether the loaded config reflects the user's file or fell back to defaults.
+///
+/// `Degraded` means the config file existed but read/parse/deserialize failed —
+/// the daemon kept running on defaults, but the user's intent was NOT applied.
+/// Exposed on `/api/health` so the silent-default path can't hide a broken config
+/// (the long-standing GAP-012-Tier-2 footgun).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigStatus {
+    /// Config loaded cleanly (or no file present — defaults are intentional).
+    Ok,
+    /// Config file exists but couldn't be loaded. Defaults applied; user is unaware unless surfaced.
+    Degraded {
+        /// Display string of the config path that failed.
+        source: String,
+        /// Human-readable error (parse/deser/read failure).
+        error: String,
+    },
+}
+
+/// Result of loading kernel config: the resolved `KernelConfig` plus a `ConfigStatus`
+/// that surfaces whether the user's file was actually applied.
+pub struct LoadResult {
+    pub config: KernelConfig,
+    pub status: ConfigStatus,
+}
+
+/// Load kernel configuration from a TOML file, returning defaults on any error.
+///
+/// **Backwards-compatible shim** — discards the `ConfigStatus`. New callers should use
+/// [`load_config_with_status`] so they can surface degraded loads via the health endpoint.
+pub fn load_config(path: Option<&Path>) -> KernelConfig {
+    load_config_with_status(path).config
+}
+
+/// Load kernel configuration from a TOML file, with defaults AND a status signal.
+///
+/// Loud-degrade policy: on any read/parse/deserialize failure of an existing config file,
+/// emits an ERROR log + stderr banner, then returns defaults plus `ConfigStatus::Degraded`.
+/// Callers should surface the status (e.g. on `/api/health`) so the user sees the failure
+/// rather than silently running on defaults.
 ///
 /// If the config contains an `include` field, included files are loaded
 /// and deep-merged first, then the root config overrides them.
-pub fn load_config(path: Option<&Path>) -> KernelConfig {
+pub fn load_config_with_status(path: Option<&Path>) -> LoadResult {
     let config_path = path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_config_path);
+
+    let mut degrade_error: Option<String> = None;
 
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
@@ -86,38 +127,41 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
                                 &config.reasoning,
                                 &config_path,
                             );
-                            return config;
+                            return LoadResult {
+                                config,
+                                status: ConfigStatus::Ok,
+                            };
                         }
                         Err(e) => {
-                            // TODO(GAP-012-Tier-2): this fallback still silently
-                            // swaps the user's intent for `KernelConfig::default()`
-                            // on any non-binding deserialization failure. Tier 1
-                            // closes the binding-shape footgun; Tier 2 should
-                            // surface remaining failures via a health endpoint
-                            // and/or stderr banner so the silent-default path
-                            // can't hide a broken config.
-                            tracing::warn!(
+                            // GAP-012-Tier-2: loud-degrade. The user's config exists but
+                            // doesn't deserialize. Promote to ERROR + stderr banner; daemon
+                            // continues on defaults but the status is observable via
+                            // /api/health so the failure can't hide.
+                            error!(
                                 error = %e,
                                 path = %config_path.display(),
                                 "Failed to deserialize merged config, using defaults"
                             );
+                            degrade_error = Some(e.to_string());
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    error!(
                         error = %e,
                         path = %config_path.display(),
                         "Failed to parse config, using defaults"
                     );
+                    degrade_error = Some(e.to_string());
                 }
             },
             Err(e) => {
-                tracing::warn!(
+                error!(
                     error = %e,
                     path = %config_path.display(),
                     "Failed to read config file, using defaults"
                 );
+                degrade_error = Some(e.to_string());
             }
         }
     } else {
@@ -133,7 +177,34 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
     // correctly say (DEFAULT).
     let cfg = KernelConfig::default();
     openfang_reasoning::log_effective_reasoning_config(&cfg.reasoning, &config_path);
-    cfg
+
+    let status = match degrade_error {
+        Some(err) => {
+            // Loud-degrade banner — written to stderr so it's visible regardless
+            // of tracing subscriber configuration. Matches the GAP-012-Tier-2
+            // intent: a broken config must not silently mask itself.
+            let banner = format!(
+                "\n===============================================================================\n\
+                 ! CONFIG DEGRADED — {}\n\
+                 ! Daemon running on DEFAULTS. Fix the file and restart, or query\n\
+                 !   GET /api/health        for status\n\
+                 !   GET /api/health/detail for the full error\n\
+                 ===============================================================================\n",
+                config_path.display()
+            );
+            eprintln!("{banner}");
+            ConfigStatus::Degraded {
+                source: config_path.display().to_string(),
+                error: err,
+            }
+        }
+        None => ConfigStatus::Ok,
+    };
+
+    LoadResult {
+        config: cfg,
+        status,
+    }
 }
 
 /// Resolve config includes by deep-merging included files into the root value.
@@ -781,5 +852,87 @@ match_rule = {{ channel = "discord", channel_id = "2" }}
 
         let config = load_config(Some(&root));
         assert_eq!(config.log_level, "trace");
+    }
+
+    // --- GAP-012-Tier-2 loud-degrade tests -----------------------------------
+
+    #[test]
+    fn load_config_with_status_returns_ok_when_file_missing() {
+        // No file present → defaults are intentional, NOT a degrade.
+        let result = load_config_with_status(Some(Path::new("/nonexistent/config.toml")));
+        assert_eq!(result.status, ConfigStatus::Ok);
+        assert_eq!(result.config.log_level, "info");
+    }
+
+    #[test]
+    fn load_config_with_status_returns_ok_on_clean_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "log_level = \"debug\"").unwrap();
+        drop(f);
+
+        let result = load_config_with_status(Some(&path));
+        assert_eq!(result.status, ConfigStatus::Ok);
+        assert_eq!(result.config.log_level, "debug");
+    }
+
+    #[test]
+    fn load_config_with_status_degrades_on_reasoning_typo() {
+        // [reasoning] with a misspelled field — deny_unknown_fields rejects it.
+        // Loud-degrade: status is Degraded, error mentions the offending field.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[reasoning]\nmontly_budget_usd = 50.0\n").unwrap();
+        drop(f);
+
+        let result = load_config_with_status(Some(&path));
+        match result.status {
+            ConfigStatus::Degraded { source, error } => {
+                assert!(
+                    source.contains("config.toml"),
+                    "source should reference the file path, got: {source}"
+                );
+                assert!(
+                    error.contains("montly_budget_usd") || error.contains("unknown field"),
+                    "error should mention the typo or 'unknown field', got: {error}"
+                );
+            }
+            ConfigStatus::Ok => panic!("expected Degraded status for typo'd reasoning section"),
+        }
+        // Daemon still gets defaults so it can boot.
+        assert_eq!(result.config.log_level, "info");
+    }
+
+    #[test]
+    fn load_config_with_status_degrades_on_malformed_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Unclosed table header — TOML parser rejects.
+        writeln!(f, "[reasoning\nmonthly_budget_usd = 50.0\n").unwrap();
+        drop(f);
+
+        let result = load_config_with_status(Some(&path));
+        assert!(
+            matches!(result.status, ConfigStatus::Degraded { .. }),
+            "expected Degraded for malformed TOML, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn load_config_backward_compat_shim_discards_status() {
+        // The shim load_config() still returns just KernelConfig for callers
+        // that don't yet need the status (tests, transient probes).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "log_level = \"warn\"").unwrap();
+        drop(f);
+
+        let config = load_config(Some(&path));
+        assert_eq!(config.log_level, "warn");
     }
 }

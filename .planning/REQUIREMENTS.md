@@ -79,6 +79,14 @@
 
 **X-06.** All workspace verification gates pass: `cargo build --workspace --lib`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`. New tests added for every new public API.
 
+**X-07.** Loud-degrade config policy (decided after W3, 2026-06-07, in lieu of changing `load_config`'s signature):
+- `crates/openfang-kernel/src/config.rs` exposes `ConfigStatus::{Ok, Degraded { source, error }}` and `load_config_with_status(...) -> LoadResult { config, status }`.
+- The legacy `load_config(...) -> KernelConfig` shim discards status — backward-compat for unaffected callers.
+- On read/parse/deserialize failure of an *existing* config file: emit ERROR-level tracing log + stderr banner + populate `ConfigStatus::Degraded`. Daemon continues on `KernelConfig::default()`.
+- Missing config file = `ConfigStatus::Ok` (defaults are intentional).
+- `OpenFangKernel` gains a `pub config_status: ConfigStatus` field, surfaced on `/api/health` (`"ok" | "degraded"`) and `/api/health/detail` (full error + source path).
+- Closes GAP-012-Tier-2 from `.planning/codebase/CONCERNS.md`.
+
 ---
 
 ## Mapping to Phase 1 success criteria (goal-backward)
@@ -95,7 +103,7 @@
 | 8 | Workspace gates pass (build, test, clippy `-D warnings`); v8→v9 migration test on populated DB included | FTS-05, X-06 |
 | 9 | Live integration test passes per CLAUDE.md workflow | X-01, X-05 |
 | 10 | 60 bundled skills load with correct defaults (`mutable=false`; `SYSTEM_SKILLS` subset `protected=true`); no build-script mutation of source files | SP-03 |
-| 11 | Typo in `[reasoning]` section causes startup error (`deny_unknown_fields`); default load logged with explicit `(DEFAULT)` marker | MR-05 |
+| 11 | Typo in any config section is **loud**: ERROR log + stderr banner; `/api/health` reports `config_status: "degraded"`; `/api/health/detail` exposes the full parse error. Daemon continues on defaults (loud-degrade policy, decided 2026-06-07 after W3 — see `STATE.md` decision log). For a clean load OR no-file-present, status is `"ok"` and the boot log carries the `(from config)` vs `(DEFAULT — no [reasoning] section)` marker from plan 01-12. | MR-05, X-07 |
 | 12 | CHANGELOG entry present with schema-v9 backward-compat note | X-04 |
 
 These twelve criteria become the Phase 1 verification checklist consumed by `gsd:verify-work`.
