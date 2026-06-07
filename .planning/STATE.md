@@ -10,9 +10,9 @@
 ## Current position
 
 - **Phase:** 01 — Self-Learning Core
-- **Wave:** W3 complete (12/16 plans). Next step: `/gsd:execute-phase 01` resumed from W4 (final implementation wave).
-- **Status:** W3 shipped — SessionStore dual-write, `skill_manage` tool + kernel adapters + capability gate, `memory_reason` tool + KernelLlmAdapter + budget wiring. All workspace gates green.
-- **Progress:** ▓▓▓▓▓▓▓▓░░ 75% (12 of 16 plans done; W4 next: 01-04 session_search, 01-09 snapshot refresh signal, 01-14 UserProfile + memory_conclude. W5 = human checkpoint.)
+- **Wave:** W3 + W3.5 (loud-degrade config policy) complete (12/16 plans + criterion 11 closed). Next: `/gsd:execute-phase 01` resumed from W4.
+- **Status:** W3 + loud-degrade shipped. Criterion 11 now has clean implementation + verification target (ERROR log + stderr banner + /api/health config_status:degraded). All workspace gates green.
+- **Progress:** ▓▓▓▓▓▓▓▓░░ 78% (12 of 16 plans + W3.5 cross-cutting fix; W4 next: 01-04 session_search, 01-09 snapshot refresh signal, 01-14 UserProfile + memory_conclude. W5 = human checkpoint.)
 
 ## Performance metrics
 
@@ -40,7 +40,7 @@
 - **`openfang-reasoning` now has `rusqlite` as a direct workspace dep** (narrow — only for the `params!` macro in BudgetTracker SQL). `openfang-kernel` gained an `openfang-reasoning` dep for the boot-time effective-config logger.
 - **`engine_reason_returns_not_yet_implemented` smoke test replaced** by `engine_reason_minimal_smoke_test` — the 01-10 stub is now real per 01-11.
 - **`BudgetRecord::new_now`, `monthly_budget_usd()` accessor, `format_effective_log`** added as a separately-testable BudgetTracker surface (Rule 2 — the privacy clamp + the boot-logger output now have direct tests, can't be bypassed accidentally).
-- **`MR-05 success-criterion 11 vs `load_config` policy:** `ReasoningConfig` has `deny_unknown_fields` (typo IS rejected by serde), but `load_config` catches the parse error and silently degrades to `KernelConfig::default()`. So criterion 11's "hard startup failure on typo" is **NOT yet met**. Decision needed before W4 about whether to change `load_config`'s blanket-degrade policy (blast radius: every config section) or add a `[reasoning]`-specific propagation path (more surgical, inconsistent). The `TODO(GAP-012-Tier-2)` from CONCERNS.md is the relevant background.
+- **MR-05 success-criterion 11 — DECIDED 2026-06-07: loud-degrade.** Closed in commit `5e98e7b` (W3.5). `ConfigStatus::{Ok, Degraded}` + `load_config_with_status` added to `crates/openfang-kernel/src/config.rs`. On read/parse/deser failure of an *existing* config file: ERROR-level tracing log + stderr banner + `kernel.config_status = Degraded`. Surfaced on `/api/health` (`config_status: "ok" | "degraded"`) and `/api/health/detail` (full error + source path). Daemon still boots on defaults so the operator can recover via the API. Missing config file = `Ok` (defaults intentional). Closes `TODO(GAP-012-Tier-2)` from CONCERNS.md. Backward-compat shim `load_config(...) -> KernelConfig` preserved. Criterion 11 in REQUIREMENTS.md updated to the observable behavior; new X-07 cross-cutting REQ documents the contract.
 - **Multiple clippy fixes inline**: `field_reassign_with_default` → struct-update form; useless `format!()` → raw string literal; `manual_flatten` → `.flatten()`; `manual_div_ceil` → `.div_ceil(4)`. All from new W2 code paths.
 
 ### Decisions made during W1 execution (2026-06-07)
