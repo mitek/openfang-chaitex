@@ -1304,6 +1304,102 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+    /// Memory reasoning engine configuration (Phase 1, plan 01-12).
+    ///
+    /// All fields default per REQ MR-05. Typos in the `[reasoning]` block
+    /// fail daemon startup with a serde parse error because the inner struct
+    /// sets `deny_unknown_fields`. When the TOML omits `[reasoning]` entirely
+    /// the inner `Default` impl sets `is_default_loaded = true` so the
+    /// startup logger can print `(DEFAULT — no [reasoning] section found in
+    /// config)` markers per the addendum § C.2.
+    #[serde(default)]
+    pub reasoning: ReasoningConfig,
+}
+
+/// Memory reasoning engine config (REQ MR-05).
+///
+/// `deny_unknown_fields` is intentional — a typo (e.g. `max_input_tkns`)
+/// must fail at startup rather than silently fall through to defaults. The
+/// `is_default_loaded` flag is `#[serde(skip)]` and is only set by the
+/// `Default` impl; the deserializer leaves it `false`, which the boot
+/// logger uses to distinguish "loaded from explicit config" from "loaded
+/// from defaults because TOML had no `[reasoning]` section".
+///
+/// Defaults must match REQ MR-05 exactly:
+/// `max_input_tokens=40000, max_output_tokens=8000, max_level="high",
+/// monthly_budget_usd=20.0, budget_exceeded_action="warn",
+/// require_approval_for_max=true, auto_update_profile=false,
+/// fts_backfill="on_startup"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningConfig {
+    /// Maximum input tokens per reasoning call (Medium+ levels).
+    #[serde(default = "default_reasoning_max_input_tokens")]
+    pub max_input_tokens: u32,
+    /// Maximum output tokens per reasoning call.
+    #[serde(default = "default_reasoning_max_output_tokens")]
+    pub max_output_tokens: u32,
+    /// Maximum allowed level (minimal|low|medium|high|max).
+    #[serde(default = "default_reasoning_max_level")]
+    pub max_level: String,
+    /// Monthly USD spend cap before `budget_exceeded_action` triggers.
+    #[serde(default = "default_reasoning_monthly_budget_usd")]
+    pub monthly_budget_usd: f64,
+    /// What to do when monthly budget is exceeded (warn|block).
+    #[serde(default = "default_reasoning_budget_action")]
+    pub budget_exceeded_action: String,
+    /// Require human approval before any `Max`-level reasoning call.
+    #[serde(default = "default_reasoning_require_approval")]
+    pub require_approval_for_max: bool,
+    /// Auto-write learned facts back into the user profile.
+    #[serde(default)]
+    pub auto_update_profile: bool,
+    /// FTS backfill strategy on daemon boot (on_startup|background|disabled).
+    #[serde(default = "default_reasoning_fts_backfill")]
+    pub fts_backfill: String,
+    /// True only when this config came from defaults because the user's
+    /// TOML had no `[reasoning]` section. Skipped by serde; set by
+    /// `Default::default()` to `true`.
+    #[serde(skip)]
+    pub is_default_loaded: bool,
+}
+
+fn default_reasoning_max_input_tokens() -> u32 {
+    40_000
+}
+fn default_reasoning_max_output_tokens() -> u32 {
+    8_000
+}
+fn default_reasoning_max_level() -> String {
+    "high".to_string()
+}
+fn default_reasoning_monthly_budget_usd() -> f64 {
+    20.0
+}
+fn default_reasoning_budget_action() -> String {
+    "warn".to_string()
+}
+fn default_reasoning_require_approval() -> bool {
+    true
+}
+fn default_reasoning_fts_backfill() -> String {
+    "on_startup".to_string()
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: default_reasoning_max_input_tokens(),
+            max_output_tokens: default_reasoning_max_output_tokens(),
+            max_level: default_reasoning_max_level(),
+            monthly_budget_usd: default_reasoning_monthly_budget_usd(),
+            budget_exceeded_action: default_reasoning_budget_action(),
+            require_approval_for_max: default_reasoning_require_approval(),
+            auto_update_profile: false,
+            fts_backfill: default_reasoning_fts_backfill(),
+            is_default_loaded: true,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1583,6 +1679,7 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             skills: HashMap::new(),
+            reasoning: ReasoningConfig::default(),
         }
     }
 }
@@ -4791,5 +4888,76 @@ shell_env_passthrough = ["*"]
 "#;
         let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.shell_env_passthrough, vec!["*"]);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // [reasoning] config — plan 01-12
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_config_default_matches_mr05() {
+        let cfg = ReasoningConfig::default();
+        assert_eq!(cfg.max_input_tokens, 40_000);
+        assert_eq!(cfg.max_output_tokens, 8_000);
+        assert_eq!(cfg.max_level, "high");
+        assert!((cfg.monthly_budget_usd - 20.0).abs() < 1e-9);
+        assert_eq!(cfg.budget_exceeded_action, "warn");
+        assert!(cfg.require_approval_for_max);
+        assert!(!cfg.auto_update_profile);
+        assert_eq!(cfg.fts_backfill, "on_startup");
+        assert!(cfg.is_default_loaded, "Default::default() must set marker");
+    }
+
+    #[test]
+    fn reasoning_config_deny_unknown_fields_rejects_typo() {
+        // Typo in a field name must fail parse, per MR-05 / success-criterion 11.
+        let bad = "max_input_tokens = 30000\nfoo = 1\nmax_level = \"medium\"\n";
+        let err = toml::from_str::<ReasoningConfig>(bad).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected `unknown field` in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reasoning_config_partial_toml_fills_defaults_and_keeps_explicit() {
+        // Explicit override of two fields; rest default. is_default_loaded
+        // stays false (this WAS supplied via TOML).
+        let toml_in = "max_input_tokens = 12345\nmax_level = \"low\"\n";
+        let cfg: ReasoningConfig = toml::from_str(toml_in).unwrap();
+        assert_eq!(cfg.max_input_tokens, 12_345);
+        assert_eq!(cfg.max_level, "low");
+        // Defaults filled in
+        assert_eq!(cfg.max_output_tokens, 8_000);
+        assert_eq!(cfg.budget_exceeded_action, "warn");
+        // Critical: serde did NOT set is_default_loaded — it's skipped, so
+        // it's false (this was an explicit TOML supply, not Default).
+        assert!(!cfg.is_default_loaded);
+    }
+
+    #[test]
+    fn kernel_config_without_reasoning_block_marks_is_default_loaded() {
+        // A KernelConfig TOML that omits the `[reasoning]` section entirely
+        // must produce a ReasoningConfig that equals Default — including
+        // `is_default_loaded == true`.
+        let toml_in = "log_level = \"debug\"\n";
+        let cfg: KernelConfig = toml::from_str(toml_in).unwrap();
+        // The struct-level `#[serde(default)]` on KernelConfig means the
+        // missing field is filled via ReasoningConfig::default(), which
+        // sets is_default_loaded=true.
+        assert!(cfg.reasoning.is_default_loaded);
+        assert_eq!(cfg.reasoning.max_level, "high");
+    }
+
+    #[test]
+    fn kernel_config_with_reasoning_typo_rejects() {
+        let toml_in = "[reasoning]\nmax_input_tkns = 30000\n";
+        let err = toml::from_str::<KernelConfig>(toml_in).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected `unknown field` in error, got: {msg}"
+        );
     }
 }
