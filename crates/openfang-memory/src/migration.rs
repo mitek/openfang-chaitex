@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -325,6 +329,154 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
         VALUES (8, datetime('now'), 'Add audit_entries table for persistent Merkle audit trail');
         ",
     )?;
+    Ok(())
+}
+
+/// Version 9: row-per-message flat table + FTS5 index for session search.
+///
+/// Sessions remain stored as msgpack BLOB in `sessions.messages` for fast
+/// load. This v9 adds a parallel flat `session_messages` table indexed by
+/// an external-content FTS5 virtual table that `SessionStore::save_session`
+/// keeps in sync (plan 01-03). The canonical session read path is
+/// unchanged — FTS5 is only consulted by the `session_search` tool and by
+/// the reasoning engine.
+///
+/// On migration we best-effort backfill the flat table from existing
+/// `sessions.messages` BLOBs (see `backfill_session_messages`).
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        -- Flat per-message storage for indexing. NOT the primary read path.
+        -- SessionStore::get_session() still loads from sessions.messages BLOB.
+        CREATE TABLE IF NOT EXISTS session_messages (
+            session_id    TEXT NOT NULL,
+            agent_id      TEXT NOT NULL,
+            message_index INTEGER NOT NULL,
+            role          TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            timestamp     TEXT NOT NULL,
+            PRIMARY KEY (session_id, message_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_messages_agent
+            ON session_messages(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_session_messages_session
+            ON session_messages(session_id);
+
+        -- External-content FTS5 index. Storage lives in session_messages;
+        -- FTS5 only stores its inverted index. Smaller on disk than
+        -- contentless or content-owning modes.
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+            content,
+            session_id   UNINDEXED,
+            agent_id     UNINDEXED,
+            role         UNINDEXED,
+            timestamp    UNINDEXED,
+            content='session_messages',
+            content_rowid='rowid',
+            tokenize='porter unicode61 remove_diacritics 1'
+        );
+
+        -- Triggers keep the FTS index in lockstep with session_messages so
+        -- plan 01-03's dual-write writers don't need to touch the FTS table
+        -- explicitly.
+        CREATE TRIGGER IF NOT EXISTS session_messages_ai
+            AFTER INSERT ON session_messages
+        BEGIN
+            INSERT INTO session_messages_fts(rowid, content, session_id, agent_id, role, timestamp)
+            VALUES (new.rowid, new.content, new.session_id, new.agent_id, new.role, new.timestamp);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_messages_ad
+            AFTER DELETE ON session_messages
+        BEGIN
+            INSERT INTO session_messages_fts(session_messages_fts, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_messages_au
+            AFTER UPDATE ON session_messages
+        BEGIN
+            INSERT INTO session_messages_fts(session_messages_fts, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+            INSERT INTO session_messages_fts(rowid, content, session_id, agent_id, role, timestamp)
+            VALUES (new.rowid, new.content, new.session_id, new.agent_id, new.role, new.timestamp);
+        END;
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add session_messages flat table + FTS5 index for session search');
+        ",
+    )?;
+
+    backfill_session_messages(conn)?;
+    Ok(())
+}
+
+/// Best-effort backfill of `session_messages` from existing `sessions.messages`
+/// BLOBs.
+///
+/// Per addendum § A.2.1 / § A.2.4 this is intentionally not all-or-nothing:
+/// a per-session msgpack decode failure logs a WARN and is skipped — the
+/// schema is still upgraded so future writes go through the dual-write
+/// path. A failing backfill never blocks a daemon boot.
+fn backfill_session_messages(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT id, agent_id, messages, updated_at FROM sessions")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO session_messages
+         (session_id, agent_id, message_index, role, content, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+
+    for row in rows {
+        let (session_id, agent_id, blob, ts) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("v9 backfill: row error, skipping: {}", e);
+                continue;
+            }
+        };
+        let messages: Vec<openfang_types::message::Message> =
+            match rmp_serde::from_slice(&blob) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "v9 backfill: msgpack decode failed, skipping: {}", e
+                    );
+                    continue;
+                }
+            };
+        for (idx, msg) in messages.iter().enumerate() {
+            let content = crate::session_fts::flatten_message_content(msg);
+            if content.is_empty() {
+                continue;
+            }
+            if let Err(e) = insert.execute(rusqlite::params![
+                session_id,
+                agent_id,
+                idx as i64,
+                crate::session_fts::role_string(&msg.role),
+                content,
+                ts,
+            ]) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    message_index = idx,
+                    "v9 backfill: row insert failed, skipping: {}", e
+                );
+                continue;
+            }
+        }
+    }
     Ok(())
 }
 
