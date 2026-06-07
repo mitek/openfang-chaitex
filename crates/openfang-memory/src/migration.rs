@@ -402,8 +402,26 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
             VALUES (new.rowid, new.content, new.session_id, new.agent_id, new.role, new.timestamp);
         END;
 
+        -- === v9 amendment: reasoning_budget (plan 01-12) ===
+        -- BudgetTracker persists one row per reasoning call. The aggregator
+        -- (`BudgetTracker::current_month_spent`) sums estimated_cost_usd
+        -- for the calendar month. timestamp is an ISO-8601 string so the
+        -- string-range filter works without parsing.
+        CREATE TABLE IF NOT EXISTS reasoning_budget (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            level TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost_usd REAL NOT NULL,
+            query_preview TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reasoning_budget_timestamp
+            ON reasoning_budget(timestamp);
+        -- === END v9 amendment ===
+
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
-        VALUES (9, datetime('now'), 'Add session_messages flat table + FTS5 index for session search');
+        VALUES (9, datetime('now'), 'Add session_messages flat table + FTS5 index for session search; reasoning_budget tracking');
         ",
     )?;
 
