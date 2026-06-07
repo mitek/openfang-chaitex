@@ -434,6 +434,8 @@ mod tests {
                 author: String::new(),
                 license: String::new(),
                 tags: vec![],
+                mutable: None,
+                protected: None,
             },
             runtime: SkillRuntimeConfig {
                 runtime_type: SkillRuntime::PromptOnly,

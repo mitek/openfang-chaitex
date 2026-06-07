@@ -250,6 +250,8 @@ pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
             author: String::new(),
             license: String::new(),
             tags: vec!["openclaw-compat".to_string(), "prompt-only".to_string()],
+            mutable: None,
+            protected: None,
         },
         runtime: SkillRuntimeConfig {
             runtime_type,
@@ -346,6 +348,8 @@ pub fn convert_skillmd_str(name_hint: &str, content: &str) -> Result<ConvertedSk
             author: "OpenFang".to_string(),
             license: "Apache-2.0".to_string(),
             tags: vec!["bundled".to_string(), "prompt-only".to_string()],
+            mutable: None,
+            protected: None,
         },
         runtime: SkillRuntimeConfig {
             runtime_type,
@@ -440,6 +444,8 @@ pub fn convert_openclaw_skill(dir: &Path) -> Result<SkillManifest, SkillError> {
             author,
             license: pkg["license"].as_str().unwrap_or("MIT").to_string(),
             tags: vec!["openclaw-compat".to_string()],
+            mutable: None,
+            protected: None,
         },
         runtime: SkillRuntimeConfig {
             runtime_type: SkillRuntime::Node,

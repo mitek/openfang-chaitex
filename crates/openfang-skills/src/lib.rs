@@ -152,6 +152,20 @@ pub struct SkillMeta {
     /// Tags for discovery.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Whether this skill can be mutated by `skill_manage` (patch/edit/delete).
+    ///
+    /// `None` = use the registry-side default applied at load time
+    /// (plan 01-07 wires this: bundled skills default to `false`, user-created
+    /// skills default to `true`). Explicit values in `skill.toml` always win.
+    /// See SP-03.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutable: Option<bool>,
+    /// Whether this skill is in the protected set — `skill_manage` mutation
+    /// attempts return a structured `ProtectedSkill` error without touching
+    /// the disk. `None` = use the registry-side default; SYSTEM_SKILLS
+    /// (including `skill-manage` itself) default to `true`. See SP-03.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected: Option<bool>,
 }
 
 fn default_version() -> String {
@@ -260,5 +274,86 @@ capabilities = ["NetConnect(*)"]
         let json = serde_json::to_string(&native).unwrap();
         let back: SkillSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, SkillSource::Native);
+    }
+
+    // -------------------------------------------------------------------
+    // SP-03: mutable / protected manifest flags (plan 01-06)
+    // -------------------------------------------------------------------
+
+    const TOML_WITHOUT_FLAGS: &str = r#"
+[skill]
+name = "noflag-skill"
+version = "0.1.0"
+description = "no extra flags present"
+author = "test"
+license = "MIT"
+tags = []
+"#;
+
+    const TOML_WITH_FLAGS: &str = r#"
+[skill]
+name = "withflag-skill"
+version = "0.1.0"
+description = "explicit flags"
+author = "test"
+license = "MIT"
+tags = []
+mutable = true
+protected = false
+"#;
+
+    #[test]
+    fn skill_toml_without_mutable_protected_parses() {
+        // SP-03: bundled skill.toml files (60 of them) currently omit both
+        // flags. They must parse, with both fields resolving to `None`.
+        let manifest: SkillManifest =
+            toml::from_str(TOML_WITHOUT_FLAGS).expect("must parse without flags");
+        assert!(manifest.skill.mutable.is_none(), "mutable defaults to None");
+        assert!(
+            manifest.skill.protected.is_none(),
+            "protected defaults to None"
+        );
+    }
+
+    #[test]
+    fn skill_toml_with_mutable_true_protected_false() {
+        let manifest: SkillManifest =
+            toml::from_str(TOML_WITH_FLAGS).expect("must parse with flags");
+        assert_eq!(manifest.skill.mutable, Some(true));
+        assert_eq!(manifest.skill.protected, Some(false));
+    }
+
+    #[test]
+    fn skill_toml_round_trip_preserves_fields() {
+        // parse -> serialize -> parse; both fields must survive.
+        let manifest: SkillManifest = toml::from_str(TOML_WITH_FLAGS).unwrap();
+        let reserialized = toml::to_string(&manifest).expect("must serialize");
+        let again: SkillManifest = toml::from_str(&reserialized).expect("must reparse");
+        assert_eq!(again.skill.mutable, Some(true));
+        assert_eq!(again.skill.protected, Some(false));
+    }
+
+    #[test]
+    fn skill_toml_serialize_omits_none_fields() {
+        // skip_serializing_if = "Option::is_none" must take effect — bundled
+        // skills round-tripped through serde should not gain spurious lines.
+        let manifest: SkillManifest = toml::from_str(TOML_WITHOUT_FLAGS).unwrap();
+        let out = toml::to_string(&manifest).expect("must serialize");
+        let has_mutable_key = out
+            .lines()
+            .any(|l| l.trim_start().starts_with("mutable"));
+        let has_protected_key = out
+            .lines()
+            .any(|l| l.trim_start().starts_with("protected"));
+        assert!(
+            !has_mutable_key,
+            "TOML output must omit `mutable` key when None, got:\n{}",
+            out
+        );
+        assert!(
+            !has_protected_key,
+            "TOML output must omit `protected` key when None, got:\n{}",
+            out
+        );
     }
 }
