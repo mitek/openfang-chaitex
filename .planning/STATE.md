@@ -10,19 +10,29 @@
 ## Current position
 
 - **Phase:** 01 — Self-Learning Core
-- **Wave:** W1 complete (5/5 plans). Next step: `/gsd:execute-phase 01` resumed from W2.
-- **Status:** W1 shipped — fts5/flattener, manifest mutable/protected flags, api_key Zeroizing, openfang-reasoning crate scaffold, SkillRegistry mutation surface. All workspace gates green.
-- **Progress:** ▓▓▓░░░░░░░ 31% (5 of 16 plans done; W2 next: 01-02, 01-07, 01-11, 01-12)
+- **Wave:** W2 complete (9/9 plans across W1+W2). Next step: `/gsd:execute-phase 01` resumed from W3.
+- **Status:** W2 shipped — schema v9 migration + FTS5 backfill, `reasoning_budget` v9 amendment, BudgetTracker + `[reasoning]` config, SYSTEM_SKILLS code-level defaults, ReasoningEngine 5-level dispatch. All workspace gates green.
+- **Progress:** ▓▓▓▓▓▓░░░░ 56% (9 of 16 plans done; W3 next: 01-03 dual-write, 01-08 skill_manage tool, 01-13 memory_reason tool)
 
 ## Performance metrics
 
 - Codebase map: 7 docs, 1769 lines, committed in `c7d3841`.
 - Phase 1 design + addendum: 855 + ~450 lines, committed in `c7d3841`.
 - Phase 1 plans: 16 PLAN.md files, 2337 lines, 46 tasks; wave distribution W1=5 W2=4 W3=3 W4=3 W5=1.
-- W1 execution: 11 commits (5 feat + 5 docs + 1 docs cumulative); 5 SUMMARY files, 567 lines; ~30+ new tests, ~2750 workspace tests passing.
-- Workspace state: clean `main`, HEAD = `1c6c5e2`.
+- W1 execution: 11 commits + STATE close; 5 SUMMARY files, 567 lines; ~30+ new tests.
+- W2 execution: 12 commits; 4 SUMMARY files; +24 net new tests (2750 → 2774 workspace tests passing).
+- Workspace state: clean `main`, HEAD = `fc4cc44`.
 
 ## Accumulated context
+
+### Decisions made during W2 execution (2026-06-07)
+
+- **`create_skill` is exempt from `check_mutable`.** Plan 01-05 wrote `self.check_mutable(name, "create")?` as the first line of `create_skill`. That was safe with the stub returning `Ok(())`, but once 01-07 promoted `check_mutable` to a real `NotFound`-on-missing-skill body, every `create_skill` call would fail (the skill doesn't exist yet — that's the whole point). The 01-07 plan explicitly notes `create_skill` is mutation-by-definition and shouldn't pre-check; removed the call and restored 16 pre-existing 01-05 mutation tests.
+- **`openfang-reasoning` now has `rusqlite` as a direct workspace dep** (narrow — only for the `params!` macro in BudgetTracker SQL). `openfang-kernel` gained an `openfang-reasoning` dep for the boot-time effective-config logger.
+- **`engine_reason_returns_not_yet_implemented` smoke test replaced** by `engine_reason_minimal_smoke_test` — the 01-10 stub is now real per 01-11.
+- **`BudgetRecord::new_now`, `monthly_budget_usd()` accessor, `format_effective_log`** added as a separately-testable BudgetTracker surface (Rule 2 — the privacy clamp + the boot-logger output now have direct tests, can't be bypassed accidentally).
+- **`MR-05 success-criterion 11 vs `load_config` policy:** `ReasoningConfig` has `deny_unknown_fields` (typo IS rejected by serde), but `load_config` catches the parse error and silently degrades to `KernelConfig::default()`. So criterion 11's "hard startup failure on typo" is **NOT yet met**. Decision needed before W4 about whether to change `load_config`'s blanket-degrade policy (blast radius: every config section) or add a `[reasoning]`-specific propagation path (more surgical, inconsistent). The `TODO(GAP-012-Tier-2)` from CONCERNS.md is the relevant background.
+- **Multiple clippy fixes inline**: `field_reassign_with_default` → struct-update form; useless `format!()` → raw string literal; `manual_flatten` → `.flatten()`; `manual_div_ceil` → `.div_ceil(4)`. All from new W2 code paths.
 
 ### Decisions made during W1 execution (2026-06-07)
 
@@ -84,4 +94,17 @@ None.
   - `aba7072 docs(01-10): complete plan — openfang-reasoning crate scaffold`
   - `3d49155 feat(01-05): SkillRegistry mutation surface (six methods + audit + events)`
   - `1c6c5e2 docs(01-05): complete plan — SkillRegistry mutation surface`
-- Next user action: `/gsd:execute-phase 01` resumed from W2 — 4 parallel plans: 01-02 v9 migration + backfill + transition test, 01-07 SYSTEM_SKILLS code-level defaults, 01-11 ReasoningEngine 5-level dispatch, 01-12 BudgetTracker + `[reasoning]` config (deny_unknown_fields) + v9 amendment.
+- W2 commits (chronological):
+  - `2d20a5e feat(01-02): schema v9 — session_messages + FTS5 + backfill`
+  - `8668e74 test(01-02): v8 → v9 transition tests on populated DB`
+  - `97cd5a0 docs(01-02): complete plan — schema v9 + FTS5 + backfill`
+  - `543aca2 feat(01-12): BudgetTracker + [reasoning] config with deny_unknown_fields`
+  - `84202b0 feat(01-12): reasoning_budget table — v9 amendment`
+  - `13e21d8 feat(01-12): BudgetTracker + boot-time effective-config log`
+  - `9232f5e docs(01-12): complete plan — BudgetTracker + [reasoning] config`
+  - `e951c52 feat(01-07): SYSTEM_SKILLS const + apply_load_time_defaults + check_mutable body`
+  - `e44e26b docs(01-07): complete plan — protected/mutable defaults + check_mutable`
+  - `e1bab4d feat(01-11): fact_retrieval — multi-source retrieval per level`
+  - `4d80a73 feat(01-11): ReasoningEngine — 5-level dispatch + first-turn caveat`
+  - `fc4cc44 docs(01-11): complete plan — ReasoningEngine level dispatch`
+- Next user action: `/gsd:execute-phase 01` resumed from W3 — 3 plans (01-03, 01-08, 01-13). W3 has cross-plan dependency: 01-08 needs kernel-side `Arc<dyn AuditAppend>` + `Arc<dyn SkillEventBus>` adapters that 01-05 left as injection points; 01-13 needs to plumb the real `ReasoningLlm` via `KernelHandle` + wire `BudgetTracker` pre/post-call onto `ReasoningEngine`.
