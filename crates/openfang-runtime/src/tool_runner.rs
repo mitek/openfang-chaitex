@@ -483,6 +483,10 @@ pub async fn execute_tool(
         "skill_describe" => tool_skill_describe(input, skill_registry),
         "skill_execute" => tool_skill_execute(input, skill_registry).await,
 
+        // === PHASE 1 PLAN 01-08 skill_manage ===
+        "skill_manage" => tool_skill_manage(input, kernel).await,
+        // === END PHASE 1 PLAN 01-08 ===
+
         // Canvas / A2UI tool
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
@@ -1349,6 +1353,29 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill"]
             }),
         },
+        // === PHASE 1 PLAN 01-08 skill_manage schema ===
+        ToolDefinition {
+            name: "skill_manage".to_string(),
+            description: "Manage skills (create, patch, edit, delete, write_file, remove_file, list). Skills are procedural memory — reusable approaches for recurring tasks. Mutation actions require capabilities.allow_skill_mutation = true in config.toml.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["create","patch","edit","delete","write_file","remove_file","list"] },
+                    "name": { "type": "string" },
+                    "content": { "type": "string" },
+                    "prompt_context": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" },
+                    "file_path": { "type": "string" },
+                    "file_content": { "type": "string" },
+                    "category": { "type": "string" },
+                    "mutable": { "type": "boolean", "description": "For create: pin new skill as mutable (default true)" }
+                },
+                "required": ["action"]
+            }),
+        },
+        // === END PHASE 1 PLAN 01-08 skill_manage schema ===
     ]
 }
 
@@ -3736,6 +3763,310 @@ async fn tool_skill_execute(
     }
 }
 
+// === PHASE 1 PLAN 01-08 skill_manage ===
+//
+// Dispatcher for the agent-facing `skill_manage` tool. Calls into the
+// kernel-held `SkillRegistry` via the `KernelHandle` accessors added in
+// the same plan. Capability-gated: every action except `list` requires
+// `capabilities.allow_skill_mutation = true` in the kernel config.
+//
+// Result shape:
+// - `list` → `{"action":"list","skills":[{name, mutable, protected, enabled}, ...]}`
+// - mutation actions on success → `{"action":..., "name":..., "ok":true,
+//   "skill_refresh_required": true}` (the refresh sentinel is consumed by
+//   plan 01-09 to trigger a registry snapshot in the agent loop).
+// - registry errors → `{"error":"<Variant>", ...}` JSON (NOT a tool-runner
+//   Err — agents need structured payloads, not Rust panics).
+async fn tool_skill_manage(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let action = input
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'action' parameter")?
+        .trim()
+        .to_string();
+
+    let kh = match kernel {
+        Some(k) => k.as_ref(),
+        None => {
+            return Ok(serde_json::json!({
+                "error": "KernelUnavailable",
+                "tool": "skill_manage",
+                "hint": "skill_manage requires a kernel handle — not available in this context.",
+            })
+            .to_string());
+        }
+    };
+
+    // Capability gate — everything except `list` requires opt-in.
+    if action != "list" {
+        let cfg = kh.kernel_config();
+        let allowed = cfg
+            .map(|c| c.capabilities.allow_skill_mutation)
+            .unwrap_or(false);
+        if !allowed {
+            return Ok(serde_json::json!({
+                "error": "CapabilityDenied",
+                "tool": "skill_manage",
+                "action": action,
+                "hint": "Set capabilities.allow_skill_mutation = true in config.toml",
+            })
+            .to_string());
+        }
+    }
+
+    // Locate the registry. `list` works even with a None registry — we
+    // just report an empty list — but mutation actions hard-fail.
+    let registry_lock = match kh.skill_registry() {
+        Some(r) => r,
+        None => {
+            if action == "list" {
+                return Ok(serde_json::json!({
+                    "action": "list",
+                    "skills": [],
+                })
+                .to_string());
+            }
+            return Ok(serde_json::json!({
+                "error": "RegistryUnavailable",
+                "tool": "skill_manage",
+                "action": action,
+                "hint": "Kernel does not expose a skill registry.",
+            })
+            .to_string());
+        }
+    };
+
+    match action.as_str() {
+        "list" => {
+            let guard = registry_lock
+                .read()
+                .map_err(|e| format!("skill_registry read lock poisoned: {e}"))?;
+            let entries: Vec<serde_json::Value> = guard
+                .list_all()
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.manifest.skill.name,
+                        "mutable": s.manifest.skill.mutable.unwrap_or(false),
+                        "protected": s.manifest.skill.protected.unwrap_or(false),
+                        "enabled": s.enabled,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "action": "list",
+                "skills": entries,
+            })
+            .to_string())
+        }
+        "create" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let content = input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'content' parameter")?
+                .to_string();
+            let prompt_context = input
+                .get("prompt_context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let category = input
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut guard = registry_lock
+                .write()
+                .map_err(|e| format!("skill_registry write lock poisoned: {e}"))?;
+            match guard.create_skill(
+                &name,
+                &content,
+                prompt_context.as_deref(),
+                category.as_deref(),
+            ) {
+                Ok(_loaded) => Ok(mutation_ok("create", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "create", Some(&name))),
+            }
+        }
+        "patch" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let old_string = input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'old_string' parameter")?
+                .to_string();
+            let new_string = input
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'new_string' parameter")?
+                .to_string();
+            let replace_all = input
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut guard = registry_lock
+                .write()
+                .map_err(|e| format!("skill_registry write lock poisoned: {e}"))?;
+            match guard.patch_skill(&name, &old_string, &new_string, replace_all) {
+                Ok(_) => Ok(mutation_ok("patch", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "patch", Some(&name))),
+            }
+        }
+        "edit" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let content = input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'content' parameter")?
+                .to_string();
+            let mut guard = registry_lock
+                .write()
+                .map_err(|e| format!("skill_registry write lock poisoned: {e}"))?;
+            match guard.edit_skill(&name, &content) {
+                Ok(_) => Ok(mutation_ok("edit", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "edit", Some(&name))),
+            }
+        }
+        "delete" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let mut guard = registry_lock
+                .write()
+                .map_err(|e| format!("skill_registry write lock poisoned: {e}"))?;
+            match guard.delete_skill(&name) {
+                Ok(_) => Ok(mutation_ok("delete", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "delete", Some(&name))),
+            }
+        }
+        "write_file" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'file_path' parameter")?
+                .to_string();
+            let file_content = input
+                .get("file_content")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'file_content' parameter")?
+                .to_string();
+            // write_skill_file takes &self (no &mut), so use a read lock —
+            // it relies on interior file-system mutation.
+            let guard = registry_lock
+                .read()
+                .map_err(|e| format!("skill_registry read lock poisoned: {e}"))?;
+            match guard.write_skill_file(&name, &file_path, file_content.as_bytes()) {
+                Ok(()) => Ok(mutation_ok("write_file", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "write_file", Some(&name))),
+            }
+        }
+        "remove_file" => {
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'name' parameter")?
+                .to_string();
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'file_path' parameter")?
+                .to_string();
+            let guard = registry_lock
+                .read()
+                .map_err(|e| format!("skill_registry read lock poisoned: {e}"))?;
+            match guard.remove_skill_file(&name, &file_path) {
+                Ok(()) => Ok(mutation_ok("remove_file", &name)),
+                Err(e) => Ok(skill_error_to_json(&e, "remove_file", Some(&name))),
+            }
+        }
+        other => Ok(serde_json::json!({
+            "error": "UnknownAction",
+            "tool": "skill_manage",
+            "action": other,
+            "hint": "Allowed actions: create, patch, edit, delete, write_file, remove_file, list.",
+        })
+        .to_string()),
+    }
+}
+
+/// Build the success JSON returned by every mutation action. Includes the
+/// `skill_refresh_required: true` sentinel that plan 01-09 reads in the
+/// agent loop to refresh the registry snapshot before the next dispatch.
+fn mutation_ok(action: &str, name: &str) -> String {
+    serde_json::json!({
+        "action": action,
+        "name": name,
+        "ok": true,
+        "skill_refresh_required": true,
+    })
+    .to_string()
+}
+
+/// Render a `SkillError` as a structured JSON payload the agent loop can
+/// parse. Keeps `Protected` / `Immutable` hints intact so the operator
+/// gets actionable unlock instructions.
+fn skill_error_to_json(
+    err: &openfang_skills::SkillError,
+    action: &str,
+    name: Option<&str>,
+) -> String {
+    use openfang_skills::SkillError;
+    let variant = match err {
+        SkillError::NotFound(_) => "NotFound",
+        SkillError::InvalidManifest(_) => "InvalidManifest",
+        SkillError::AlreadyInstalled(_) => "AlreadyInstalled",
+        SkillError::RuntimeNotAvailable(_) => "RuntimeNotAvailable",
+        SkillError::ExecutionFailed(_) => "ExecutionFailed",
+        SkillError::Io(_) => "Io",
+        SkillError::Network(_) => "Network",
+        SkillError::RateLimited(_) => "RateLimited",
+        SkillError::TomlParse(_) => "TomlParse",
+        SkillError::YamlParse(_) => "YamlParse",
+        SkillError::SecurityBlocked(_) => "SecurityBlocked",
+        SkillError::Config(_) => "Config",
+        SkillError::Protected { .. } => "Protected",
+        SkillError::Immutable { .. } => "Immutable",
+    };
+    let mut payload = serde_json::json!({
+        "error": variant,
+        "tool": "skill_manage",
+        "action": action,
+        "message": err.to_string(),
+    });
+    if let Some(n) = name {
+        payload["name"] = serde_json::Value::String(n.to_string());
+    }
+    // Preserve the unlock hint as a structured field for Protected /
+    // Immutable variants — the operator who tried to mutate a protected
+    // skill needs to see the hint without scraping the message.
+    if let SkillError::Protected { hint, .. } | SkillError::Immutable { hint, .. } = err {
+        payload["hint"] = serde_json::Value::String(hint.clone());
+    }
+    payload.to_string()
+}
+// === END PHASE 1 PLAN 01-08 ===
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5010,5 +5341,377 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_lowercase().contains("kernel"));
+    }
+
+    // ===== Plan 01-08 skill_manage tests =====
+
+    /// Minimal KernelHandle fake that exposes a real `SkillRegistry`
+    /// (rooted in a tempdir) and a configurable `KernelConfig`. Every
+    /// other trait method either returns the default `Err`/empty or
+    /// short-circuits — we only exercise `kernel_config()` and
+    /// `skill_registry()` here.
+    struct SkillFakeKernel {
+        cfg: openfang_types::config::KernelConfig,
+        registry: std::sync::RwLock<openfang_skills::registry::SkillRegistry>,
+    }
+
+    impl SkillFakeKernel {
+        fn new(allow_mutation: bool, skills_dir: std::path::PathBuf) -> Self {
+            let mut cfg = openfang_types::config::KernelConfig::default();
+            cfg.capabilities.allow_skill_mutation = allow_mutation;
+            let registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+            Self {
+                cfg,
+                registry: std::sync::RwLock::new(registry),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kernel_handle::KernelHandle for SkillFakeKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not used".into())
+        }
+        async fn send_to_agent(
+            &self,
+            _agent_id: &str,
+            _message: &str,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_store(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_recall(
+            &self,
+            _key: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn task_claim(
+            &self,
+            _agent_id: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        async fn task_complete(
+            &self,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn task_list(
+            &self,
+            _status: Option<&str>,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![])
+        }
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(vec![])
+        }
+
+        fn kernel_config(&self) -> Option<&openfang_types::config::KernelConfig> {
+            Some(&self.cfg)
+        }
+        fn skill_registry(
+            &self,
+        ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
+            Some(&self.registry)
+        }
+    }
+
+    fn user_skill_toml(name: &str) -> String {
+        format!(
+            "[skill]\n\
+             name = \"{name}\"\n\
+             version = \"0.1.0\"\n\
+             description = \"A user-created skill for testing.\"\n\
+             mutable = true\n\
+             \n\
+             [runtime]\n\
+             type = \"promptonly\"\n"
+        )
+    }
+
+    fn make_handle_with_allow(
+        allow: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<dyn crate::kernel_handle::KernelHandle>,
+        Arc<SkillFakeKernel>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(SkillFakeKernel::new(allow, dir.path().to_path_buf()));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        (dir, handle, fake)
+    }
+
+    #[tokio::test]
+    async fn skill_manage_list_returns_empty_when_registry_empty() {
+        let (_dir, handle, _fake) = make_handle_with_allow(false);
+        let out = tool_skill_manage(&serde_json::json!({"action": "list"}), Some(&handle))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "list");
+        assert_eq!(v["skills"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn skill_manage_list_returns_skills_with_flags() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+        // Seed two skills directly via the registry to avoid going
+        // through the tool (which we test separately below).
+        {
+            let mut reg = fake.registry.write().unwrap();
+            reg.create_skill("alpha", &user_skill_toml("alpha"), None, None)
+                .unwrap();
+            reg.create_skill("beta", &user_skill_toml("beta"), None, None)
+                .unwrap();
+        }
+        let out = tool_skill_manage(&serde_json::json!({"action": "list"}), Some(&handle))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "list");
+        let arr = v["skills"].as_array().unwrap();
+        let names: Vec<&str> = arr.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        for s in arr {
+            // user-created skills patch mutable = true on disk
+            assert_eq!(s["mutable"], true, "user skill should be mutable");
+            assert_eq!(s["enabled"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_manage_create_invokes_registry_and_sets_refresh_required() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+        let out = tool_skill_manage(
+            &serde_json::json!({
+                "action": "create",
+                "name": "spam-classifier",
+                "content": user_skill_toml("spam-classifier"),
+            }),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "create");
+        assert_eq!(v["name"], "spam-classifier");
+        assert_eq!(v["ok"], true);
+        assert_eq!(
+            v["skill_refresh_required"], true,
+            "every mutation must include the refresh sentinel (SP-04)"
+        );
+        // Real registry side-effect: the skill is present.
+        let reg = fake.registry.read().unwrap();
+        assert!(reg.get("spam-classifier").is_some());
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_modifies_skill_and_signals_refresh() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+        // Seed
+        {
+            let mut reg = fake.registry.write().unwrap();
+            reg.create_skill("note", &user_skill_toml("note"), None, None)
+                .unwrap();
+        }
+        // Patch the version string
+        let out = tool_skill_manage(
+            &serde_json::json!({
+                "action": "patch",
+                "name": "note",
+                "old_string": "version = \"0.1.0\"",
+                "new_string": "version = \"0.2.0\"",
+            }),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "patch");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["skill_refresh_required"], true);
+        // Real on-disk effect.
+        let reg = fake.registry.read().unwrap();
+        let skill = reg.get("note").unwrap();
+        assert_eq!(skill.manifest.skill.version, "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_on_protected_returns_structured_error() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+        // Seed a skill with mutable=false (which triggers Immutable, not
+        // Protected — but check_mutable will still surface a structured
+        // error with a hint).
+        let immutable_toml = "[skill]\n\
+             name = \"locked\"\n\
+             version = \"0.1.0\"\n\
+             description = \"Locked skill\"\n\
+             mutable = false\n\
+             protected = true\n\
+             \n\
+             [runtime]\n\
+             type = \"promptonly\"\n";
+        {
+            let mut reg = fake.registry.write().unwrap();
+            // create_skill bypasses check_mutable per plan 01-07.
+            reg.create_skill("locked", immutable_toml, None, None)
+                .unwrap();
+        }
+        let out = tool_skill_manage(
+            &serde_json::json!({
+                "action": "patch",
+                "name": "locked",
+                "old_string": "0.1.0",
+                "new_string": "0.2.0",
+            }),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Protected is checked before Immutable in check_mutable.
+        assert_eq!(v["error"], "Protected");
+        assert_eq!(v["tool"], "skill_manage");
+        assert_eq!(v["action"], "patch");
+        assert_eq!(v["name"], "locked");
+        // The unlock hint must be preserved verbatim.
+        assert!(
+            v["hint"].as_str().unwrap().contains("protected = false"),
+            "expected protected hint, got {}",
+            v["hint"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_manage_blocked_when_capability_off() {
+        let (_dir, handle, _fake) = make_handle_with_allow(false);
+        let out = tool_skill_manage(
+            &serde_json::json!({
+                "action": "create",
+                "name": "any",
+                "content": user_skill_toml("any"),
+            }),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "CapabilityDenied");
+        assert_eq!(v["action"], "create");
+        assert!(
+            v["hint"]
+                .as_str()
+                .unwrap()
+                .contains("allow_skill_mutation"),
+            "hint must reference the config key"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_manage_list_works_when_capability_off() {
+        let (_dir, handle, fake) = make_handle_with_allow(false);
+        // Even with mutation disabled, list still works.
+        {
+            let mut reg = fake.registry.write().unwrap();
+            reg.create_skill("readable", &user_skill_toml("readable"), None, None)
+                .unwrap();
+        }
+        let out = tool_skill_manage(&serde_json::json!({"action": "list"}), Some(&handle))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "list");
+        assert_eq!(v["skills"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skill_manage_delete_removes_and_signals_refresh() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+        {
+            let mut reg = fake.registry.write().unwrap();
+            reg.create_skill("doomed", &user_skill_toml("doomed"), None, None)
+                .unwrap();
+        }
+        let out = tool_skill_manage(
+            &serde_json::json!({"action": "delete", "name": "doomed"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action"], "delete");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["skill_refresh_required"], true);
+        let reg = fake.registry.read().unwrap();
+        assert!(reg.get("doomed").is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_manage_unknown_action_returns_structured_error() {
+        let (_dir, handle, _fake) = make_handle_with_allow(true);
+        let out = tool_skill_manage(
+            &serde_json::json!({"action": "frobnicate", "name": "x"}),
+            Some(&handle),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"], "UnknownAction");
+        assert_eq!(v["action"], "frobnicate");
     }
 }

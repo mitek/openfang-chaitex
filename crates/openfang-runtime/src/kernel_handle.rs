@@ -267,4 +267,26 @@ pub trait KernelHandle: Send + Sync {
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
     }
+
+    /// Borrow the kernel's `KernelConfig`. Returns `None` for kernel
+    /// implementations that don't carry a config (test fakes).
+    ///
+    /// Added in plan 01-08 so the `skill_manage` tool can read the
+    /// `capabilities.allow_skill_mutation` gate without smuggling a clone
+    /// through every dispatch.
+    fn kernel_config(&self) -> Option<&openfang_types::config::KernelConfig> {
+        None
+    }
+
+    /// Borrow the kernel's `SkillRegistry` RwLock. Returns `None` for kernel
+    /// implementations that don't expose a registry (test fakes).
+    ///
+    /// Added in plan 01-08 so the `skill_manage` tool can dispatch to the
+    /// six mutation methods from plan 01-05 + the two helpers added in
+    /// 01-08 (`delete_skill`, `remove_skill_file`).
+    fn skill_registry(
+        &self,
+    ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
+        None
+    }
 }

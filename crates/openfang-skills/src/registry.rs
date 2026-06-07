@@ -1025,6 +1025,63 @@ impl SkillRegistry {
         self.publish_updated(name);
         Ok(())
     }
+
+    /// SP-01: delete a skill entirely — gated through `check_mutable` so
+    /// protected/immutable skills cannot be deleted.
+    ///
+    /// Removes the skill from the in-memory registry AND removes its
+    /// on-disk directory. Audits the deletion and publishes a
+    /// `SkillUpdated` event so the agent loop refreshes its snapshot
+    /// (plan 01-09).
+    pub fn delete_skill(&mut self, name: &str) -> Result<(), SkillError> {
+        self.check_mutable(name, "delete")?;
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+        let path = skill.path.clone();
+        self.audit_append(
+            "skill_delete",
+            serde_json::json!({
+                "name": name,
+                "path": path.display().to_string(),
+            }),
+        )?;
+        // Drop the in-memory entry, then remove the directory. Order is
+        // chosen so a failed disk removal still surfaces a NotFound on
+        // the next access rather than leaving a half-loaded skill.
+        self.skills.remove(name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        self.publish_updated(name);
+        Ok(())
+    }
+
+    /// SP-01: remove an auxiliary file inside the skill directory.
+    /// Mirrors `write_skill_file` — does not touch the manifest, so no
+    /// `load_skill` / `SkillUpdated` is emitted. Gated through
+    /// `check_mutable`. Path-traversal rejected.
+    pub fn remove_skill_file(&self, name: &str, file_path: &str) -> Result<(), SkillError> {
+        self.check_mutable(name, "remove_file")?;
+        Self::reject_traversal(file_path)?;
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+        let target = skill.path.join(file_path);
+        self.audit_append(
+            "skill_remove_file",
+            serde_json::json!({
+                "name": name,
+                "path": target.display().to_string(),
+            }),
+        )?;
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

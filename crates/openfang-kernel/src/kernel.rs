@@ -180,6 +180,14 @@ pub struct OpenFangKernel {
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// Broadcast sender for `SkillUpdated` events (plan 01-08 wiring).
+    ///
+    /// Wired into `SkillRegistry::set_event_bus(...)` at boot via the
+    /// `KernelSkillEventBus` adapter. Plan 01-09's snapshot-refresh
+    /// subscriber in the agent loop will `subscribe()` here to receive
+    /// notifications after every mutation.
+    pub skill_updated_tx:
+        tokio::sync::broadcast::Sender<crate::skill_adapters::SkillUpdated>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1221,6 +1229,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
+            skill_updated_tx: crate::skill_adapters::new_skill_updated_channel(),
         };
 
         // Wire HAND.toml load events into the Merkle audit chain so reload
@@ -1256,6 +1265,29 @@ impl OpenFangKernel {
                         "ok",
                     );
                 }));
+        }
+
+        // Plan 01-08: wire kernel-side adapters into the skill registry so
+        // mutations leave Merkle audit entries and emit `skill.updated`
+        // events on the broadcast channel plan 01-09 subscribes to.
+        {
+            let audit_appender = Arc::new(crate::skill_adapters::KernelAuditAppender::new(
+                Arc::clone(&kernel.audit_log),
+            ));
+            let event_bus = Arc::new(crate::skill_adapters::KernelSkillEventBus::new(
+                kernel.skill_updated_tx.clone(),
+            ));
+            match kernel.skill_registry.write() {
+                Ok(mut reg) => {
+                    reg.set_audit_appender(audit_appender);
+                    reg.set_event_bus(event_bus);
+                }
+                Err(e) => {
+                    warn!(
+                        "skill_registry write lock poisoned at boot — skill audit/event wiring skipped: {e}"
+                    );
+                }
+            }
         }
 
         // Restore persisted agents from SQLite
@@ -7857,6 +7889,19 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
+    }
+
+    // Plan 01-08: expose config + skill registry so the `skill_manage`
+    // tool can read the capability gate and dispatch to registry mutation
+    // methods without smuggling clones through tool_runner.
+    fn kernel_config(&self) -> Option<&openfang_types::config::KernelConfig> {
+        Some(&self.config)
+    }
+
+    fn skill_registry(
+        &self,
+    ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
+        Some(&self.skill_registry)
     }
 }
 

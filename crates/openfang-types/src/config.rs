@@ -713,6 +713,28 @@ impl Default for ExtensionsConfig {
     }
 }
 
+/// Kernel-level capability toggles (Phase 1 plan 01-08).
+///
+/// Coarse on/off switches for self-modifying features that the agent loop
+/// must consult before taking destructive or self-mutating actions. Default
+/// is the safest: every capability is `false` so the kernel ships
+/// inert-by-default and the user must opt in via `config.toml`.
+///
+/// Example `~/.openfang/config.toml`:
+/// ```toml
+/// [capabilities]
+/// allow_skill_mutation = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KernelCapabilities {
+    /// Allow the `skill_manage` tool to perform mutations (create/patch/edit/
+    /// delete/write_file/remove_file). The `list` action is always allowed.
+    /// Default: `false`.
+    #[serde(default)]
+    pub allow_skill_mutation: bool,
+}
+
 /// Credential vault configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1314,6 +1336,13 @@ pub struct KernelConfig {
     /// config)` markers per the addendum § C.2.
     #[serde(default)]
     pub reasoning: ReasoningConfig,
+    /// Kernel-level capability toggles (Phase 1, plan 01-08).
+    ///
+    /// Coarse on/off switches for self-modifying features (currently:
+    /// `allow_skill_mutation`). Default is every-capability-off so the
+    /// kernel ships inert-by-default.
+    #[serde(default)]
+    pub capabilities: KernelCapabilities,
 }
 
 /// Memory reasoning engine config (REQ MR-05).
@@ -1680,6 +1709,7 @@ impl Default for KernelConfig {
             heartbeat: HeartbeatSettings::default(),
             skills: HashMap::new(),
             reasoning: ReasoningConfig::default(),
+            capabilities: KernelCapabilities::default(),
         }
     }
 }
@@ -4959,5 +4989,27 @@ shell_env_passthrough = ["*"]
             msg.contains("unknown field"),
             "expected `unknown field` in error, got: {msg}"
         );
+    }
+
+    // ---- plan 01-08 capability flag ----
+
+    #[test]
+    fn kernel_capabilities_default_allow_skill_mutation_false() {
+        let caps = KernelCapabilities::default();
+        assert!(!caps.allow_skill_mutation);
+    }
+
+    #[test]
+    fn kernel_config_without_capabilities_block_defaults_off() {
+        let toml_in = "log_level = \"debug\"\n";
+        let cfg: KernelConfig = toml::from_str(toml_in).unwrap();
+        assert!(!cfg.capabilities.allow_skill_mutation);
+    }
+
+    #[test]
+    fn kernel_config_with_capabilities_block_deserializes() {
+        let toml_in = "[capabilities]\nallow_skill_mutation = true\n";
+        let cfg: KernelConfig = toml::from_str(toml_in).unwrap();
+        assert!(cfg.capabilities.allow_skill_mutation);
     }
 }
