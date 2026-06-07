@@ -1165,7 +1165,13 @@ pub struct KernelConfig {
     /// API authentication key. When set, all API endpoints (except /api/health)
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
-    pub api_key: String,
+    ///
+    /// SECURITY: stored in `zeroize::Zeroizing<String>` so the secret is
+    /// wiped from memory when the config drops (X-03). Existing TOML
+    /// (`api_key = "..."`) deserializes unchanged via the `zeroizing_string`
+    /// serde adapter at the bottom of this file.
+    #[serde(with = "zeroizing_string", default = "default_api_key")]
+    pub api_key: zeroize::Zeroizing<String>,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1489,6 +1495,43 @@ fn default_thread_ttl() -> u64 {
     24
 }
 
+/// Default value for `KernelConfig::api_key` — empty `Zeroizing<String>`.
+///
+/// Used by `#[serde(default = "default_api_key")]` so a TOML config missing
+/// the `api_key` field deserializes to an empty key (the unauthenticated
+/// local-dev mode).
+fn default_api_key() -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(String::new())
+}
+
+/// Serde adapter for `zeroize::Zeroizing<String>`.
+///
+/// `Zeroizing<T>` does not implement `Serialize` / `Deserialize` directly
+/// without the upstream `serde` feature. We avoid pulling that in (it would
+/// turn on the `serde` cargo feature on `zeroize` workspace-wide) by using a
+/// thin `#[serde(with = "zeroizing_string")]` adapter — TOML sees a plain
+/// `String`, the field stores `Zeroizing<String>`. The secret is wiped from
+/// memory when the config drops (X-03).
+mod zeroizing_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S>(value: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Zeroizing::new(s))
+    }
+}
+
 impl Default for KernelConfig {
     fn default() -> Self {
         let home_dir = openfang_home_dir();
@@ -1502,7 +1545,7 @@ impl Default for KernelConfig {
             memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
-            api_key: String::new(),
+            api_key: zeroize::Zeroizing::new(String::new()),
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -3924,6 +3967,57 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.api_listen, "127.0.0.1:50051");
         assert!(!config.network_enabled);
+    }
+
+    #[test]
+    fn kernel_config_default_api_key_is_empty_zeroizing() {
+        // X-03: the default api_key is an empty Zeroizing<String>. The empty
+        // value means "unauthenticated local-dev mode" — same as before, just
+        // wrapped so the secret is wiped on drop.
+        let config = KernelConfig::default();
+        assert!(config.api_key.is_empty());
+    }
+
+    #[test]
+    fn kernel_config_debug_redacts_api_key() {
+        // X-03 invariant: the custom Debug impl must keep printing <redacted>
+        // for set api_key — never the secret itself. Empty keys print <empty>.
+        let mut config = KernelConfig::default();
+        let dbg_empty = format!("{:?}", config);
+        assert!(
+            dbg_empty.contains("<empty>"),
+            "empty api_key should debug-print as <empty>, got: {}",
+            dbg_empty
+        );
+        config.api_key = zeroize::Zeroizing::new("super-secret-bearer".to_string());
+        let dbg_set = format!("{:?}", config);
+        assert!(
+            dbg_set.contains("<redacted>"),
+            "set api_key should debug-print as <redacted>, got: {}",
+            dbg_set
+        );
+        assert!(
+            !dbg_set.contains("super-secret-bearer"),
+            "Debug output MUST NOT leak the api_key plaintext, got: {}",
+            dbg_set
+        );
+    }
+
+    #[test]
+    fn kernel_config_api_key_toml_round_trip() {
+        // X-03: TOML round-trip — existing user configs with `api_key = "..."`
+        // must continue to deserialize unchanged.
+        let toml_in = r#"
+api_key = "round-trip-key"
+"#;
+        let cfg: KernelConfig = toml::from_str(toml_in).expect("must parse");
+        assert_eq!(cfg.api_key.as_str(), "round-trip-key");
+        let out = toml::to_string(&cfg).expect("must serialize");
+        assert!(
+            out.contains("api_key = \"round-trip-key\""),
+            "expected api_key line in:\n{}",
+            out
+        );
     }
 
     #[test]

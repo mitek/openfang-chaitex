@@ -609,7 +609,8 @@ impl OpenFangKernel {
                 let key = key.trim().to_string();
                 if !key.is_empty() {
                     info!("Using API key from OPENFANG_API_KEY environment variable");
-                    config.api_key = key;
+                    // SECURITY: zeroize on drop (X-03).
+                    config.api_key = zeroize::Zeroizing::new(key);
                 }
             }
         }
