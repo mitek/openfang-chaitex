@@ -10,9 +10,9 @@
 ## Current position
 
 - **Phase:** 01 — Self-Learning Core
-- **Wave:** W2 complete (9/9 plans across W1+W2). Next step: `/gsd:execute-phase 01` resumed from W3.
-- **Status:** W2 shipped — schema v9 migration + FTS5 backfill, `reasoning_budget` v9 amendment, BudgetTracker + `[reasoning]` config, SYSTEM_SKILLS code-level defaults, ReasoningEngine 5-level dispatch. All workspace gates green.
-- **Progress:** ▓▓▓▓▓▓░░░░ 56% (9 of 16 plans done; W3 next: 01-03 dual-write, 01-08 skill_manage tool, 01-13 memory_reason tool)
+- **Wave:** W3 complete (12/16 plans). Next step: `/gsd:execute-phase 01` resumed from W4 (final implementation wave).
+- **Status:** W3 shipped — SessionStore dual-write, `skill_manage` tool + kernel adapters + capability gate, `memory_reason` tool + KernelLlmAdapter + budget wiring. All workspace gates green.
+- **Progress:** ▓▓▓▓▓▓▓▓░░ 75% (12 of 16 plans done; W4 next: 01-04 session_search, 01-09 snapshot refresh signal, 01-14 UserProfile + memory_conclude. W5 = human checkpoint.)
 
 ## Performance metrics
 
@@ -20,10 +20,19 @@
 - Phase 1 design + addendum: 855 + ~450 lines, committed in `c7d3841`.
 - Phase 1 plans: 16 PLAN.md files, 2337 lines, 46 tasks; wave distribution W1=5 W2=4 W3=3 W4=3 W5=1.
 - W1 execution: 11 commits + STATE close; 5 SUMMARY files, 567 lines; ~30+ new tests.
-- W2 execution: 12 commits; 4 SUMMARY files; +24 net new tests (2750 → 2774 workspace tests passing).
-- Workspace state: clean `main`, HEAD = `fc4cc44`.
+- W2 execution: 12 commits + STATE close; 4 SUMMARY files; +24 net new tests (→ 2774).
+- W3 execution: 8 commits; 3 SUMMARY files; +34 net new tests (→ 2808).
+- Workspace state: clean `main`, HEAD = `0c79d1d`.
 
 ## Accumulated context
+
+### Decisions made during W3 execution (2026-06-07)
+
+- **`skill_manage` action list grew from 6 to 8** — plan 01-08 listed 7 actions (`create`, `patch`, `edit`, `delete`, `write_file`, `remove_file`, `list`); plan 01-05 had only delivered 6 mutation methods (no `delete_skill` / `remove_skill_file`). Added both as wrappers in `openfang-skills::registry` honoring `check_mutable` per the Protected/Immutable invariants. The full action set in the tool is now 7 + `list`.
+- **`KernelCapabilities` sub-struct created on `KernelConfig`** — no such struct existed; added with a single field `allow_skill_mutation: bool` (default `false`). Wired into `Default` impl. `[capabilities]` is the new config section.
+- **`KernelHandle::complete` does not exist; introduced `KernelLlm` trait** in `openfang-reasoning` instead — matches the trait-extension pattern from 01-05 (`AuditAppend`, `SkillEventBus`). `OpenFangKernel` implements `KernelLlm`. `openfang-runtime` gained `openfang-reasoning` as a direct dep so trait signatures can name public types. Crate DAG stays acyclic.
+- **`ReasoningLlm::synthesize_with_usage` default method added** so real `TokenUsage` can flow without breaking existing test impls. The engine reads `usage.total() > 0` to pick the real-token path vs the `chars/4` coarse heuristic.
+- **`kernel.skill_updated_tx: broadcast::Sender<SkillUpdated>`** is wired and emits on every mutation. The agent loop subscribes in W4 plan 01-09 — for W3 the `skill_refresh_required: true` sentinel ships as an in-band JSON field on the tool result.
 
 ### Decisions made during W2 execution (2026-06-07)
 
@@ -107,4 +116,17 @@ None.
   - `e1bab4d feat(01-11): fact_retrieval — multi-source retrieval per level`
   - `4d80a73 feat(01-11): ReasoningEngine — 5-level dispatch + first-turn caveat`
   - `fc4cc44 docs(01-11): complete plan — ReasoningEngine level dispatch`
-- Next user action: `/gsd:execute-phase 01` resumed from W3 — 3 plans (01-03, 01-08, 01-13). W3 has cross-plan dependency: 01-08 needs kernel-side `Arc<dyn AuditAppend>` + `Arc<dyn SkillEventBus>` adapters that 01-05 left as injection points; 01-13 needs to plumb the real `ReasoningLlm` via `KernelHandle` + wire `BudgetTracker` pre/post-call onto `ReasoningEngine`.
+- W3 commits (chronological):
+  - `327448d feat(01-03): SessionStore.save_session dual-writes session_messages`
+  - `249b5c9 docs(01-03): complete plan — SessionStore.save_session dual-writes session_messages`
+  - `950e53a feat(01-08): skill_manage tool + kernel adapters`
+  - `928791d docs(01-08): complete plan — skill_manage tool + kernel adapters`
+  - `51c0d5b feat(01-13): KernelLlmAdapter`
+  - `1260b07 feat(01-13): wire BudgetTracker pre/post-call onto ReasoningEngine`
+  - `7b39b72 feat(01-13): memory_reason tool`
+  - `0c79d1d docs(01-13): complete plan — memory_reason tool + KernelLlmAdapter`
+- Next user action: `/gsd:execute-phase 01` resumed from W4 — 3 implementation plans + W5 checkpoint:
+  - **01-04** `session_search` tool — lifts `fact_retrieval::fts5_session_search` into `SessionStore::search_sessions_fts` (shared by reasoning and the tool), adds tool dispatch + schema entry under new anchors.
+  - **01-09** snapshot refresh signal — agent loop subscribes to `kernel.skill_updated_tx` broadcast and consumes the `skill_refresh_required: true` JSON sentinel from skill_manage tool results; promotes typed `ToolOutcome` at call sites in `agent_loop.rs`.
+  - **01-14** UserProfile struct + `memory_conclude` tool — reuses `KernelHandle::reasoning_engine/budget_tracker/reasoning_config` accessors added in 01-13 (do not redeclare).
+  - **01-16** human-verify checkpoint (W5) — exercises all four new tools end-to-end against a live daemon per CLAUDE.md.
