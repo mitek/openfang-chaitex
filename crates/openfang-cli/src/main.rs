@@ -1561,18 +1561,23 @@ fn cmd_start(config: Option<PathBuf>, yolo: bool) {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut kernel_config = openfang_kernel::config::load_config(config.as_deref());
+        // W3.5 loud-degrade: use load_config_with_status so the daemon
+        // surfaces ConfigStatus::Degraded on /api/health when a typo'd
+        // config falls through to defaults.
+        let config_load = openfang_kernel::config::load_config_with_status(config.as_deref());
+        let mut kernel_config = config_load.config;
         if yolo {
             kernel_config.approval.auto_approve = true;
             kernel_config.approval.apply_shorthands();
         }
-        let kernel = match OpenFangKernel::boot_with_config(kernel_config) {
+        let mut kernel = match OpenFangKernel::boot_with_config(kernel_config) {
             Ok(k) => k,
             Err(e) => {
                 boot_kernel_error(&e);
                 std::process::exit(1);
             }
         };
+        kernel.config_status = config_load.status;
 
         let listen_addr = kernel.config.api_listen.clone();
         let daemon_info_path = kernel.config.home_dir.join("daemon.json");
