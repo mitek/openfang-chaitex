@@ -19,6 +19,7 @@ pub mod engine;
 pub mod error;
 pub mod fact_retrieval;
 pub mod kernel_llm;
+pub mod profile;
 
 pub use budget::{
     format_effective_log, log_effective_reasoning_config, BudgetRecord, BudgetTracker,
@@ -27,6 +28,10 @@ pub use engine::FIRST_TURN_CAVEAT;
 pub use error::ReasoningError;
 pub use fact_retrieval::retrieve_facts;
 pub use kernel_llm::{KernelLlm, KernelLlmAdapter};
+pub use profile::{
+    add_fact, add_pattern, load_profile, save_profile, set_preference, BehavioralPattern,
+    FactSource as ProfileFactSource, Preference, UserFact, UserProfile,
+};
 
 use openfang_types::agent::AgentId;
 use serde::{Deserialize, Serialize};
