@@ -307,7 +307,7 @@ pub async fn execute_tool(
         "memory_recall" => tool_memory_recall(input, kernel),
 
         // === PHASE 1 PLAN 01-13 memory_reason ===
-        "memory_reason" => tool_memory_reason(input, kernel).await,
+        "memory_reason" => tool_memory_reason(input, kernel, caller_agent_id).await,
         // === END PHASE 1 PLAN 01-13 ===
 
         // === PHASE 1 PLAN 01-04 session_search ===
@@ -4237,6 +4237,7 @@ fn skill_error_to_json(
 async fn tool_memory_reason(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let query = input
         .get("query")
@@ -4367,6 +4368,23 @@ async fn tool_memory_reason(
     };
     match engine.reason(q).await {
         Ok(r) => {
+            // Plan 01-14 opt-in writeback: when `auto_update_profile` is
+            // enabled AND the answered level is Medium+, persist the
+            // synthesized answer as a derived `UserFact` so the agent
+            // accumulates conclusions across turns. Failures here are
+            // WARN-logged and never fail the tool — the reasoning answer
+            // is what the agent actually needs.
+            if cfg.auto_update_profile
+                && r.level >= openfang_reasoning::ReasoningLevel::Medium
+            {
+                if let Err(err) =
+                    maybe_writeback_profile(kh, caller_agent_id, &r, &level_str)
+                {
+                    tracing::warn!(
+                        "memory_reason auto_update_profile writeback failed: {err}"
+                    );
+                }
+            }
             // MR-04 result shape: all six fields present at the top
             // level of the tool result JSON.
             Ok(serde_json::json!({
@@ -4381,6 +4399,44 @@ async fn tool_memory_reason(
         }
         Err(e) => Ok(reasoning_error_to_json(&e)),
     }
+}
+
+/// Plan 01-14: best-effort writeback of a `memory_reason` answer as a
+/// `UserFact` on the calling agent's profile. Returns `Err(String)` on
+/// any failure path (no caller / no memory / invalid agent ID / KV
+/// failure) — the caller only logs.
+fn maybe_writeback_profile(
+    kh: &dyn KernelHandle,
+    caller_agent_id: Option<&str>,
+    result: &openfang_reasoning::ReasoningResult,
+    requested_level: &str,
+) -> Result<(), String> {
+    let agent_id_str = caller_agent_id
+        .ok_or_else(|| "no caller_agent_id available".to_string())?;
+    let agent_id: openfang_types::agent::AgentId = agent_id_str
+        .parse()
+        .map_err(|e| format!("invalid agent id: {e}"))?;
+    let memory = kh
+        .memory()
+        .ok_or_else(|| "kernel has no memory accessor".to_string())?;
+    let mut profile = openfang_reasoning::profile::load_profile(&memory, &agent_id)
+        .map_err(|e| format!("load_profile: {e}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    openfang_reasoning::profile::add_fact(
+        &mut profile,
+        openfang_reasoning::profile::UserFact {
+            fact: result.answer.clone(),
+            confidence: result.confidence,
+            source: openfang_reasoning::profile::FactSource::MemoryReason {
+                level: requested_level.to_string(),
+            },
+            first_observed: now.clone(),
+            last_confirmed: now,
+        },
+    );
+    openfang_reasoning::profile::save_profile(&memory, &agent_id, &mut profile)
+        .map_err(|e| format!("save_profile: {e}"))?;
+    Ok(())
 }
 
 /// Parse the agent-supplied reasoning level string into the enum.
@@ -6432,6 +6488,9 @@ mod tests {
         cfg: openfang_types::config::KernelConfig,
         engine: Arc<ReasoningEngine>,
         tracker: Arc<BudgetTracker>,
+        /// Plan 01-14: shared substrate so the writeback path can persist
+        /// to the same KV the test reads back from.
+        memory: Arc<MemorySubstrate>,
     }
 
     impl ReasonFakeKernel {
@@ -6445,7 +6504,7 @@ mod tests {
             let tracker = Arc::new(BudgetTracker::new(mem.clone(), monthly_budget));
             let llm: Arc<dyn openfang_reasoning::ReasoningLlm> =
                 Arc::new(DirectLlmShim { inner: ReasonMockLlm });
-            let engine = ReasoningEngine::new(mem)
+            let engine = ReasoningEngine::new(mem.clone())
                 .with_llm(llm)
                 .with_budget(tracker.clone(), budget_exceeded_action);
             let mut cfg = openfang_types::config::KernelConfig::default();
@@ -6457,7 +6516,16 @@ mod tests {
                 cfg,
                 engine: Arc::new(engine),
                 tracker,
+                memory: mem,
             }
+        }
+
+        /// Plan 01-14 test helper: flip `auto_update_profile` on the
+        /// owned config so the writeback test gates `true` without
+        /// having to construct the whole config inline.
+        fn with_auto_update(mut self, auto: bool) -> Self {
+            self.cfg.reasoning.auto_update_profile = auto;
+            self
         }
     }
 
@@ -6567,6 +6635,11 @@ mod tests {
         ) -> Option<openfang_types::config::ReasoningConfig> {
             Some(self.cfg.reasoning.clone())
         }
+        // Plan 01-14: expose the shared substrate so memory_reason's
+        // opt-in writeback and memory_conclude tests can persist to it.
+        fn memory(&self) -> Option<Arc<MemorySubstrate>> {
+            Some(self.memory.clone())
+        }
     }
 
     #[tokio::test]
@@ -6576,6 +6649,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "what is rust?", "reasoning_level": "medium"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6606,6 +6680,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "deep question", "reasoning_level": "max"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6630,6 +6705,7 @@ mod tests {
                 "approved": true,
             }),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6656,6 +6732,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "x", "reasoning_level": "medium"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6685,6 +6762,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "x", "reasoning_level": "medium"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6701,6 +6779,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "x", "reasoning_level": "high"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6718,6 +6797,7 @@ mod tests {
         let _ = tool_memory_reason(
             &serde_json::json!({"query": "x", "reasoning_level": "low"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6735,6 +6815,7 @@ mod tests {
         let out = tool_memory_reason(
             &serde_json::json!({"query": "x", "reasoning_level": "ludicrous"}),
             Some(&handle),
+            None,
         )
         .await
         .unwrap();
@@ -6854,6 +6935,191 @@ mod tests {
             1,
             "exactly one fresh_skill_snapshot call from this branch"
         );
+    }
+
+    // ===== Plan 01-14 memory_conclude / profile auto-update tests =====
+
+    fn agent_id_str(a: &openfang_types::agent::AgentId) -> String {
+        a.0.to_string()
+    }
+
+    #[tokio::test]
+    async fn memory_conclude_writes_fact_to_profile() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let out = tool_memory_conclude(
+            &serde_json::json!({
+                "kind": "fact",
+                "fact": "user likes rust",
+                "confidence": 0.9,
+            }),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["kind"], "fact");
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(profile.facts.len(), 1);
+        assert_eq!(profile.facts[0].fact, "user likes rust");
+        assert!((profile.facts[0].confidence - 0.9).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn memory_conclude_writes_preference() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let out = tool_memory_conclude(
+            &serde_json::json!({
+                "kind": "preference",
+                "key": "language",
+                "value": "Rust",
+                "confidence": 0.95,
+            }),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["key"], "language");
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        let pref = profile.preferences.get("language").expect("pref present");
+        assert_eq!(pref.value, "Rust");
+        assert!((pref.confidence - 0.95).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn memory_conclude_writes_pattern() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let out = tool_memory_conclude(
+            &serde_json::json!({
+                "kind": "pattern",
+                "pattern": "asks at night",
+                "occurrences": 3,
+            }),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["kind"], "pattern");
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(profile.patterns.len(), 1);
+        assert_eq!(profile.patterns[0].pattern, "asks at night");
+        assert_eq!(profile.patterns[0].occurrences, 3);
+    }
+
+    #[tokio::test]
+    async fn memory_reason_with_auto_update_false_does_not_write_profile() {
+        // Default config: auto_update_profile=false.
+        let fake = Arc::new(ReasonFakeKernel::new("high", false, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let _ = tool_memory_reason(
+            &serde_json::json!({"query": "tell me about rust", "reasoning_level": "medium"}),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(
+            profile.facts.len(),
+            0,
+            "default config must NOT auto-write facts"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reason_with_auto_update_true_writes_after_medium() {
+        let fake =
+            Arc::new(ReasonFakeKernel::new("high", false, 100.0, "warn").with_auto_update(true));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let _ = tool_memory_reason(
+            &serde_json::json!({"query": "tell me about rust", "reasoning_level": "medium"}),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(
+            profile.facts.len(),
+            1,
+            "auto_update_profile=true must write after Medium"
+        );
+        // Source is MemoryReason and level matches the requested.
+        match &profile.facts[0].source {
+            openfang_reasoning::profile::FactSource::MemoryReason { level } => {
+                assert_eq!(level, "medium");
+            }
+            other => panic!("expected MemoryReason source, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_reason_with_auto_update_true_does_not_write_after_low() {
+        let fake =
+            Arc::new(ReasonFakeKernel::new("high", false, 100.0, "warn").with_auto_update(true));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let _ = tool_memory_reason(
+            &serde_json::json!({"query": "shallow", "reasoning_level": "low"}),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+
+        let profile = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(
+            profile.facts.len(),
+            0,
+            "Low must not trigger writeback even when auto_update is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_conclude_persists_across_loads() {
+        let fake = Arc::new(ReasonFakeKernel::new("high", true, 100.0, "warn"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let _ = tool_memory_conclude(
+            &serde_json::json!({
+                "kind": "fact",
+                "fact": "persisted fact",
+                "confidence": 0.7,
+            }),
+            Some(&handle),
+            Some(&agent_id_str(&agent_id)),
+        )
+        .await
+        .unwrap();
+
+        // First load.
+        let p1 = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(p1.facts.len(), 1);
+        // Second load via a fresh call — must yield the same content.
+        let p2 = openfang_reasoning::profile::load_profile(&fake.memory, &agent_id).unwrap();
+        assert_eq!(p1.facts, p2.facts);
+        assert_eq!(p1.preferences, p2.preferences);
+        assert_eq!(p1.patterns, p2.patterns);
     }
 
     /// Counter-test: a read-only tool result with no sentinel does NOT
