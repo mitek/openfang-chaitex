@@ -10,9 +10,9 @@
 ## Current position
 
 - **Phase:** 01 — Self-Learning Core
-- **Wave:** W3 + W3.5 (loud-degrade config policy) complete (12/16 plans + criterion 11 closed). Next: `/gsd:execute-phase 01` resumed from W4.
-- **Status:** W3 + loud-degrade shipped. Criterion 11 now has clean implementation + verification target (ERROR log + stderr banner + /api/health config_status:degraded). All workspace gates green.
-- **Progress:** ▓▓▓▓▓▓▓▓░░ 78% (12 of 16 plans + W3.5 cross-cutting fix; W4 next: 01-04 session_search, 01-09 snapshot refresh signal, 01-14 UserProfile + memory_conclude. W5 = human checkpoint.)
+- **Wave:** W4 complete (15/16 plans + W3.5 cross-cutting fix). All implementation plans done. Next: 01-16 — W5 human-verify checkpoint (requires `GROQ_API_KEY` + user sign-off).
+- **Status:** Phase 1 implementation 100% complete. Four new agent tools live: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green.
+- **Progress:** ▓▓▓▓▓▓▓▓▓░ 94% (15 implementation plans + W3.5; pending only 01-16 W5 human checkpoint sign-off against a live daemon).
 
 ## Performance metrics
 
@@ -21,10 +21,19 @@
 - Phase 1 plans: 16 PLAN.md files, 2337 lines, 46 tasks; wave distribution W1=5 W2=4 W3=3 W4=3 W5=1.
 - W1 execution: 11 commits + STATE close; 5 SUMMARY files, 567 lines; ~30+ new tests.
 - W2 execution: 12 commits + STATE close; 4 SUMMARY files; +24 net new tests (→ 2774).
-- W3 execution: 8 commits; 3 SUMMARY files; +34 net new tests (→ 2808).
-- Workspace state: clean `main`, HEAD = `0c79d1d`.
+- W3 execution: 8 commits + STATE close; 3 SUMMARY files; +34 net new tests (→ 2808).
+- W3.5 (loud-degrade): 2 commits; criterion 11 closed; +5 net new tests (→ 2813).
+- W4 execution: 11 commits; 3 SUMMARY files; +21 net new tests (→ 2834).
+- Workspace state: clean `main`, HEAD = `64e5524`.
 
 ## Accumulated context
+
+### Decisions made during W4 execution (2026-06-08)
+
+- **`SessionStore::search_sessions_fts` is the canonical FTS5 query path.** Plan 01-04 lifted the SQL from `openfang-reasoning::fact_retrieval::fts5_session_search`; `fact_retrieval` now delegates to the memory-crate method. Single source of truth for FTS5 BM25 + snippet rendering. The `SessionSearchHit` struct lives in `openfang-memory`.
+- **`execute_tool -> ToolResult` signature preserved**, parallel `execute_tool_with_outcome -> ToolOutcome` wrapper added by plan 01-09. The agent loop migrated to the new wrapper; ~15 existing test sites and the `openfang-api` route continue using the legacy signature with no behavior change. Zero downstream blast radius. Pragmatic deviation from the plan's literal "promote at all call sites" wording.
+- **`KernelHandle::fresh_skill_snapshot()` added** in plan 01-09 as the snapshot refresh entry point. Subscribes to `kernel.skill_updated_tx` broadcast (wired by 01-08) and consumes the `"skill_refresh_required": true` JSON sentinel from `skill_manage` results. The agent loop calls it post-tool before the next dispatch.
+- **`tool_memory_reason` signature gained `caller_agent_id: Option<&str>`** so 01-14's `auto_update_profile` writeback hook knows whose profile to update. Updated all 8 existing test call sites with `None`. Mechanical.
 
 ### Decisions made during W3 execution (2026-06-07)
 
@@ -125,8 +134,16 @@ None.
   - `1260b07 feat(01-13): wire BudgetTracker pre/post-call onto ReasoningEngine`
   - `7b39b72 feat(01-13): memory_reason tool`
   - `0c79d1d docs(01-13): complete plan — memory_reason tool + KernelLlmAdapter`
-- Next user action: `/gsd:execute-phase 01` resumed from W4 — 3 implementation plans + W5 checkpoint:
-  - **01-04** `session_search` tool — lifts `fact_retrieval::fts5_session_search` into `SessionStore::search_sessions_fts` (shared by reasoning and the tool), adds tool dispatch + schema entry under new anchors.
-  - **01-09** snapshot refresh signal — agent loop subscribes to `kernel.skill_updated_tx` broadcast and consumes the `skill_refresh_required: true` JSON sentinel from skill_manage tool results; promotes typed `ToolOutcome` at call sites in `agent_loop.rs`.
-  - **01-14** UserProfile struct + `memory_conclude` tool — reuses `KernelHandle::reasoning_engine/budget_tracker/reasoning_config` accessors added in 01-13 (do not redeclare).
-  - **01-16** human-verify checkpoint (W5) — exercises all four new tools end-to-end against a live daemon per CLAUDE.md.
+- W4 commits (chronological):
+  - `1ceaddb feat(01-04): SessionStore.search_sessions_fts + lift reasoning FTS`
+  - `c1a15dd feat(01-04): session_search tool dispatch + schema`
+  - `cac8457 docs(01-04): complete plan — session_search tool + SessionStore.search_sessions_fts`
+  - `cf752cd feat(01-09): KernelHandle::fresh_skill_snapshot + kernel impl`
+  - `cf4904c feat(01-09): ToolOutcome type + execute_tool_with_outcome wrapper`
+  - `14f4448 feat(01-09): wire ToolOutcome into agent_loop + snapshot refresh tests`
+  - `fb4f804 docs(01-09): complete plan — ToolOutcome + snapshot refresh signal in agent_loop`
+  - `7d62baa feat(01-14): UserProfile types + KV load/save helpers`
+  - `12b3762 feat(01-14): memory_conclude tool dispatch + schema`
+  - `4f88cba feat(01-14): auto_update_profile writeback in memory_reason + 7 tests`
+  - `64e5524 docs(01-14): complete plan — UserProfile + memory_conclude tool + opt-in writeback`
+- Next user action: **01-16 — W5 human-verify checkpoint.** Requires `GROQ_API_KEY` (or equivalent provider key) + a clean v8 or fresh `~/.openfang/memory.db`. Per the plan: stop any running daemon, build release CLI, `openfang start`, exercise all four new tools end-to-end via curl, verify 12 success criteria from REQUIREMENTS.md ("Mapping" table), capture results in `.planning/phases/01-self-learning-core/01-16-UAT.md`. Then sign off. Reference workflow: 8-step live integration test in [`CLAUDE.md`](../CLAUDE.md).
