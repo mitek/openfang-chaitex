@@ -11,7 +11,7 @@ Three sequential phases extend OpenFang with self-learning capabilities to close
 
 | # | Phase | Status | Started | Completed |
 |---|-------|--------|---------|-----------|
-| 1 | Self-Learning Core | planned | 2026-06-06 | — |
+| 1 | Self-Learning Core | ✅ shipped + signed off | 2026-06-06 | 2026-06-08 |
 | 2 | Tool Expansion | not started | — | — |
 | 3 | Coordination | not started | — | — |
 
@@ -21,7 +21,8 @@ Three sequential phases extend OpenFang with self-learning capabilities to close
 
 **Slug:** `01-self-learning-core`
 **Estimated effort:** 6-8 weeks
-**Status:** planned (codebase mapped, design + addendum complete, ready for `/gsd:plan-phase 01`)
+**Actual:** 2 days of focused execution (2026-06-06 → 2026-06-08), aided by parallel planning + executor agents
+**Status:** ✅ **SHIPPED + SIGNED OFF** 2026-06-08. UAT at [`phases/01-self-learning-core/01-16-UAT.md`](phases/01-self-learning-core/01-16-UAT.md). 12/12 success criteria addressed.
 
 ### Goal
 

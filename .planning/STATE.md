@@ -9,10 +9,10 @@
 
 ## Current position
 
-- **Phase:** 01 — Self-Learning Core
-- **Wave:** W4 complete (15/16 plans + W3.5 cross-cutting fix). All implementation plans done. Next: 01-16 — W5 human-verify checkpoint (requires `GROQ_API_KEY` + user sign-off).
-- **Status:** Phase 1 implementation 100% complete. Four new agent tools live: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green.
-- **Progress:** ▓▓▓▓▓▓▓▓▓░ 94% (15 implementation plans + W3.5; pending only 01-16 W5 human checkpoint sign-off against a live daemon).
+- **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
+- **Wave:** all 5 waves shipped + W3.5 cross-cutting fix + UAT-found `b2b056d` daemon-start fix. 16/16 plans done.
+- **Status:** Phase 1 100% complete + signed off. Four new agent tools live and exercised end-to-end via DeepSeek: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green; 12/12 success criteria addressed (10 PASS, 1 PASS via unit tests with live deferred, 1 WIRED with documented UX follow-up).
+- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 02 (Tool Expansion) — currently unscoped, awaits inventory of which Hermes tools to bring across.
 
 ## Performance metrics
 
@@ -146,4 +146,8 @@ None.
   - `12b3762 feat(01-14): memory_conclude tool dispatch + schema`
   - `4f88cba feat(01-14): auto_update_profile writeback in memory_reason + 7 tests`
   - `64e5524 docs(01-14): complete plan — UserProfile + memory_conclude tool + opt-in writeback`
-- Next user action: **01-16 — W5 human-verify checkpoint.** Requires `GROQ_API_KEY` (or equivalent provider key) + a clean v8 or fresh `~/.openfang/memory.db`. Per the plan: stop any running daemon, build release CLI, `openfang start`, exercise all four new tools end-to-end via curl, verify 12 success criteria from REQUIREMENTS.md ("Mapping" table), capture results in `.planning/phases/01-self-learning-core/01-16-UAT.md`. Then sign off. Reference workflow: 8-step live integration test in [`CLAUDE.md`](../CLAUDE.md).
+- **Phase 1 SIGNED OFF** (2026-06-08, Dmitry Shilov). UAT recorded at [`.planning/phases/01-self-learning-core/01-16-UAT.md`](phases/01-self-learning-core/01-16-UAT.md).
+- Two follow-ups for post-Phase-1 polish (not blocking):
+  - **ApprovalRequired terminal-state UX** — `tool_memory_reason` should return `Err(...)` (or `is_error: true`) instead of `Ok(json_with_error_field)` so the agent's loop guard catches it on the first attempt and the structured cost prompt surfaces to the user instead of "Max iterations exceeded".
+  - **Budget exposure endpoint** — add `/api/reasoning/budget` (or fold into `/api/budget`) so warn-downgrade and block paths can be probed live without daemon restarts.
+- **Next phase: 02 — Tool Expansion** (currently unscoped). Pre-Phase-2 work: inventory Hermes built-in tools against current OpenFang built-ins to pick the ~27 highest-value additions. See [`ROADMAP.md`](ROADMAP.md#phase-2--tool-expansion).
