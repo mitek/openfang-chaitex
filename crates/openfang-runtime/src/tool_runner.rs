@@ -575,6 +575,93 @@ pub async fn execute_tool(
     }
 }
 
+// === PHASE 1 PLAN 01-09 snapshot refresh ===
+//
+// `ToolOutcome` couples the underlying `ToolResult` with the boolean
+// `skill_refresh_required` sentinel that mutation tools embed in their
+// JSON result (plan 01-08's `skill_manage` is the only emitter today).
+// The agent loop reads `outcome.skill_refresh_required` after every tool
+// call and — when true — re-snapshots the kernel's `SkillRegistry` so
+// the very next tool dispatch in the same turn sees the patched skill.
+//
+// Read-only / non-mutation tool results yield `skill_refresh_required:
+// false` (cheap boolean check on the common path — no perf regression).
+/// Bundled outcome of a single tool dispatch: the underlying
+/// [`ToolResult`] plus the parsed `skill_refresh_required` sentinel.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    /// The conventional tool result the LLM ultimately sees.
+    pub result: ToolResult,
+    /// True when the tool result JSON contains `"skill_refresh_required":
+    /// true` — set by `skill_manage` mutations. Triggers the agent loop's
+    /// `fresh_skill_snapshot()` post-process step (plan 01-09).
+    pub skill_refresh_required: bool,
+}
+
+/// Same as [`execute_tool`] but returns a [`ToolOutcome`] carrying the
+/// `skill_refresh_required` sentinel for plan 01-09's mid-turn registry
+/// refresh path. Pre-existing call sites (tests, the API route) keep
+/// using `execute_tool` for backwards compatibility.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_outcome(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    allowed_tools: Option<&[String]>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+    web_ctx: Option<&WebToolsContext>,
+    browser_ctx: Option<&crate::browser::BrowserManager>,
+    allowed_env_vars: Option<&[String]>,
+    workspace_root: Option<&Path>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    tts_engine: Option<&crate::tts::TtsEngine>,
+    docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
+    process_manager: Option<&crate::process_manager::ProcessManager>,
+) -> ToolOutcome {
+    let result = execute_tool(
+        tool_use_id,
+        tool_name,
+        input,
+        kernel,
+        allowed_tools,
+        caller_agent_id,
+        skill_registry,
+        mcp_connections,
+        web_ctx,
+        browser_ctx,
+        allowed_env_vars,
+        workspace_root,
+        media_engine,
+        exec_policy,
+        tts_engine,
+        docker_config,
+        process_manager,
+    )
+    .await;
+
+    let skill_refresh_required = parse_skill_refresh_sentinel(&result.content);
+    ToolOutcome {
+        result,
+        skill_refresh_required,
+    }
+}
+
+/// Parse the `skill_refresh_required` boolean sentinel out of a tool
+/// result body. Non-JSON / non-object results return `false` (no
+/// refresh). Only `true` triggers the refresh — any other shape (or a
+/// missing key) is a no-op so the common read-only tool path stays cheap.
+fn parse_skill_refresh_sentinel(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.get("skill_refresh_required").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
+}
+// === END PHASE 1 PLAN 01-09 ===
+
 /// Get definitions for all built-in tools.
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
