@@ -310,6 +310,16 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// Borrow the kernel's shared `MemorySubstrate` (plan 01-14).
+    ///
+    /// Default returns `None` for test fakes. The kernel impl returns
+    /// the `Arc` it already holds so tools like `memory_conclude` can
+    /// call the `openfang_reasoning::profile::{load,save}_profile`
+    /// helpers without each tool needing its own KV plumbing.
+    fn memory(&self) -> Option<std::sync::Arc<openfang_memory::MemorySubstrate>> {
+        None
+    }
+
     /// Take a fresh snapshot of the `SkillRegistry` (deep-clone via
     /// `SkillRegistry::snapshot()`). Used by the agent loop after a
     /// `skill_manage` mutation surfaces a `skill_refresh_required`

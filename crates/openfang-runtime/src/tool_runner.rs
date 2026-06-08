@@ -314,6 +314,10 @@ pub async fn execute_tool(
         "session_search" => tool_session_search(input, kernel).await,
         // === END PHASE 1 PLAN 01-04 ===
 
+        // === PHASE 1 PLAN 01-14 memory_conclude ===
+        "memory_conclude" => tool_memory_conclude(input, kernel, caller_agent_id).await,
+        // === END PHASE 1 PLAN 01-14 ===
+
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
         "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
@@ -1502,6 +1506,25 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // === END PHASE 1 PLAN 01-04 session_search schema ===
+        // === PHASE 1 PLAN 01-14 memory_conclude schema ===
+        ToolDefinition {
+            name: "memory_conclude".to_string(),
+            description: "Persist an explicit conclusion (fact / preference / behavioral pattern) about the user into the per-agent user profile. Use after a memory_reason call to durably remember what you learned, or any time the user states a stable fact/preference. kind=fact stores a free-text observation; kind=preference stores a typed key/value (overwrites prior); kind=pattern records a recurring behavior and increments occurrences when the same pattern text is added again.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind":        { "type": "string", "enum": ["fact","preference","pattern"], "description": "Which profile bucket to write to" },
+                    "fact":        { "type": "string", "description": "Required for kind=fact" },
+                    "confidence":  { "type": "number", "description": "Confidence in [0.0, 1.0]; default 0.8 for fact/preference, ignored for pattern" },
+                    "key":         { "type": "string", "description": "Required for kind=preference" },
+                    "value":       { "type": "string", "description": "Required for kind=preference" },
+                    "pattern":     { "type": "string", "description": "Required for kind=pattern" },
+                    "occurrences": { "type": "integer", "description": "Increment count for pattern (default 1)" }
+                },
+                "required": ["kind"]
+            }),
+        },
+        // === END PHASE 1 PLAN 01-14 memory_conclude schema ===
     ]
 }
 
@@ -4482,6 +4505,211 @@ async fn tool_session_search(
     }
 }
 // === END PHASE 1 PLAN 01-04 ===
+
+// === PHASE 1 PLAN 01-14 memory_conclude ===
+//
+// Dispatcher for the agent-facing `memory_conclude` tool. Persists an
+// explicit user-profile entry (fact / preference / pattern) into the
+// kernel's `MemorySubstrate` structured KV under
+// `__user_profile__/<agent_uuid>` via the
+// `openfang_reasoning::profile::{load,save}_profile` helpers.
+//
+// Caller scoping:
+// - `caller_agent_id` (the calling agent's UUID string) is parsed into
+//   an `AgentId` and used as the profile owner. When absent the tool
+//   returns an `AgentIdMissing` JSON error rather than silently writing
+//   to the shared bucket — profile contents are user-bound.
+//
+// Result shape: `{"ok": true, "kind": "<kind>", "key": "<key>"}` (key
+// echoes the preference key or the pattern text for traceability).
+async fn tool_memory_conclude(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kind = input
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'kind' parameter")?
+        .to_lowercase();
+
+    let kh = match kernel {
+        Some(k) => k.as_ref(),
+        None => {
+            return Ok(serde_json::json!({
+                "error": "KernelUnavailable",
+                "tool": "memory_conclude",
+            })
+            .to_string());
+        }
+    };
+
+    let memory = match kh.memory() {
+        Some(m) => m,
+        None => {
+            return Ok(serde_json::json!({
+                "error": "MemoryUnavailable",
+                "tool": "memory_conclude",
+            })
+            .to_string());
+        }
+    };
+
+    let agent_id_str = match caller_agent_id {
+        Some(s) => s,
+        None => {
+            return Ok(serde_json::json!({
+                "error": "AgentIdMissing",
+                "tool": "memory_conclude",
+                "hint": "memory_conclude requires the calling agent's ID — pass through tool_runner.",
+            })
+            .to_string());
+        }
+    };
+    let agent_id: openfang_types::agent::AgentId = match agent_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(serde_json::json!({
+                "error": "AgentIdInvalid",
+                "tool": "memory_conclude",
+                "agent_id": agent_id_str,
+            })
+            .to_string());
+        }
+    };
+
+    let mut profile = match openfang_reasoning::profile::load_profile(&memory, &agent_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "error": "ProfileLoadFailed",
+                "tool": "memory_conclude",
+                "message": e.to_string(),
+            })
+            .to_string());
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let result_key: String = match kind.as_str() {
+        "fact" => {
+            let fact = match input.get("fact").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(serde_json::json!({
+                    "error": "MissingField",
+                    "tool": "memory_conclude",
+                    "field": "fact",
+                })
+                .to_string()),
+            };
+            let confidence = input
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(0.8)
+                .clamp(0.0, 1.0);
+            openfang_reasoning::profile::add_fact(
+                &mut profile,
+                openfang_reasoning::profile::UserFact {
+                    fact: fact.clone(),
+                    confidence,
+                    source: openfang_reasoning::profile::FactSource::StructuredKv {
+                        key: "__memory_conclude__".to_string(),
+                    },
+                    first_observed: now.clone(),
+                    last_confirmed: now.clone(),
+                },
+            );
+            fact
+        }
+        "preference" => {
+            let key = match input.get("key").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(serde_json::json!({
+                    "error": "MissingField",
+                    "tool": "memory_conclude",
+                    "field": "key",
+                })
+                .to_string()),
+            };
+            let value = match input.get("value").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Ok(serde_json::json!({
+                    "error": "MissingField",
+                    "tool": "memory_conclude",
+                    "field": "value",
+                })
+                .to_string()),
+            };
+            let confidence = input
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(0.8)
+                .clamp(0.0, 1.0);
+            openfang_reasoning::profile::set_preference(
+                &mut profile,
+                openfang_reasoning::profile::Preference {
+                    key: key.clone(),
+                    value,
+                    confidence,
+                },
+            );
+            key
+        }
+        "pattern" => {
+            let pattern = match input.get("pattern").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(serde_json::json!({
+                    "error": "MissingField",
+                    "tool": "memory_conclude",
+                    "field": "pattern",
+                })
+                .to_string()),
+            };
+            let occurrences = input
+                .get("occurrences")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            openfang_reasoning::profile::add_pattern(
+                &mut profile,
+                openfang_reasoning::profile::BehavioralPattern {
+                    pattern: pattern.clone(),
+                    occurrences,
+                    first_seen: now.clone(),
+                    last_seen: now.clone(),
+                },
+            );
+            pattern
+        }
+        other => {
+            return Ok(serde_json::json!({
+                "error": "UnknownKind",
+                "tool": "memory_conclude",
+                "kind": other,
+                "hint": "Allowed: fact, preference, pattern.",
+            })
+            .to_string());
+        }
+    };
+
+    if let Err(e) = openfang_reasoning::profile::save_profile(&memory, &agent_id, &mut profile) {
+        return Ok(serde_json::json!({
+            "error": "ProfileSaveFailed",
+            "tool": "memory_conclude",
+            "message": e.to_string(),
+        })
+        .to_string());
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "kind": kind,
+        "key": result_key,
+    })
+    .to_string())
+}
+// === END PHASE 1 PLAN 01-14 ===
 
 #[cfg(test)]
 mod tests {

@@ -7979,6 +7979,14 @@ impl KernelHandle for OpenFangKernel {
         Some(&self.skill_registry)
     }
 
+    /// Plan 01-14: expose the kernel's shared memory substrate so
+    /// `tool_memory_conclude` (and any future profile-aware tool) can
+    /// load / persist the per-agent `__user_profile__/<agent_uuid>` KV
+    /// entry without duplicating KV plumbing.
+    fn memory(&self) -> Option<Arc<openfang_memory::MemorySubstrate>> {
+        Some(Arc::clone(&self.memory))
+    }
+
     /// Plan 01-09: take a fresh snapshot of the registry after a
     /// mutation. Acquires the read lock briefly, calls
     /// `SkillRegistry::snapshot()` (a synchronous deep-clone), drops the
