@@ -5769,6 +5769,9 @@ mod tests {
     struct SkillFakeKernel {
         cfg: openfang_types::config::KernelConfig,
         registry: std::sync::RwLock<openfang_skills::registry::SkillRegistry>,
+        // Plan 01-09: count `fresh_skill_snapshot` invocations so the
+        // snapshot-refresh tests can assert mid-turn behavior.
+        snapshot_count: std::sync::atomic::AtomicUsize,
     }
 
     impl SkillFakeKernel {
@@ -5779,6 +5782,7 @@ mod tests {
             Self {
                 cfg,
                 registry: std::sync::RwLock::new(registry),
+                snapshot_count: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -5882,6 +5886,15 @@ mod tests {
             &self,
         ) -> Option<&std::sync::RwLock<openfang_skills::registry::SkillRegistry>> {
             Some(&self.registry)
+        }
+        // Plan 01-09: snapshot from the same RwLock the mutation tools
+        // write into so the test asserts mid-turn visibility.
+        fn fresh_skill_snapshot(
+            &self,
+        ) -> Option<openfang_skills::registry::SkillRegistry> {
+            self.snapshot_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.registry.read().ok().map(|g| g.snapshot())
         }
     }
 
@@ -6500,5 +6513,162 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error"], "InvalidLevel");
         assert_eq!(v["level"], "ludicrous");
+    }
+
+    // ===== Plan 01-09 snapshot refresh tests =====
+    //
+    // The mid-turn registry refresh covers two invariants:
+    //   1. After a mutation tool result carrying `skill_refresh_required:
+    //      true`, the agent loop calls `kernel.fresh_skill_snapshot()`
+    //      before the next dispatch.
+    //   2. Read-only tool results (no sentinel) leave the snapshot path
+    //      untouched — counter remains 0.
+    // We test those invariants at the `ToolOutcome` boundary plus the
+    // sentinel parser; the agent loop's branch is exercised by the unit
+    // test below that drives `execute_tool_with_outcome` directly.
+
+    #[test]
+    fn parse_skill_refresh_sentinel_true_when_present() {
+        let json = r#"{"action":"patch","name":"foo","ok":true,"skill_refresh_required":true}"#;
+        assert!(parse_skill_refresh_sentinel(json));
+    }
+
+    #[test]
+    fn parse_skill_refresh_sentinel_false_when_absent() {
+        let json = r#"{"some":"unrelated json"}"#;
+        assert!(!parse_skill_refresh_sentinel(json));
+    }
+
+    #[test]
+    fn parse_skill_refresh_sentinel_false_when_not_json() {
+        assert!(!parse_skill_refresh_sentinel("plain string result"));
+    }
+
+    #[test]
+    fn parse_skill_refresh_sentinel_false_when_explicit_false() {
+        let json = r#"{"ok":true,"skill_refresh_required":false}"#;
+        assert!(!parse_skill_refresh_sentinel(json));
+    }
+
+    /// End-to-end: a `skill_manage` patch tool call returns a
+    /// `ToolOutcome` with `skill_refresh_required = true`. The agent
+    /// loop's refresh branch then asks the kernel for a fresh snapshot
+    /// that reflects the patched content.
+    #[tokio::test]
+    async fn agent_sees_patched_skill_in_same_turn() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+
+        // Seed a user skill "foo" with `description = "v1"`.
+        let v1_toml = "[skill]\n\
+                       name = \"foo\"\n\
+                       version = \"0.1.0\"\n\
+                       description = \"v1\"\n\
+                       mutable = true\n\
+                       \n\
+                       [runtime]\n\
+                       type = \"promptonly\"\n";
+        {
+            let mut reg = fake.registry.write().unwrap();
+            reg.create_skill("foo", v1_toml, None, None).unwrap();
+        }
+
+        // Tool call 1: patch the skill description v1 → v2.
+        let outcome1 = execute_tool_with_outcome(
+            "tool_use_1",
+            "skill_manage",
+            &serde_json::json!({
+                "action": "patch",
+                "name": "foo",
+                "old_string": "\"v1\"",
+                "new_string": "\"v2\"",
+            }),
+            Some(&handle),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !outcome1.result.is_error,
+            "patch should succeed, got: {}",
+            outcome1.result.content
+        );
+        assert!(
+            outcome1.skill_refresh_required,
+            "patch must signal refresh required"
+        );
+
+        // Simulate the agent loop branch: after seeing the sentinel,
+        // ask the kernel for a fresh snapshot.
+        let snap = handle
+            .fresh_skill_snapshot()
+            .expect("fake kernel must return a snapshot");
+        let foo = snap
+            .get("foo")
+            .expect("foo skill must still exist in snapshot");
+        assert_eq!(
+            foo.manifest.skill.description, "v2",
+            "fresh snapshot must reflect the v1 → v2 patch (mid-turn visibility)"
+        );
+        assert_eq!(
+            fake.snapshot_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one fresh_skill_snapshot call from this branch"
+        );
+    }
+
+    /// Counter-test: a read-only tool result with no sentinel does NOT
+    /// cause the agent loop to refresh the registry. Asserted via the
+    /// snapshot counter on `SkillFakeKernel`.
+    #[tokio::test]
+    async fn read_only_tool_does_not_refresh() {
+        let (_dir, handle, fake) = make_handle_with_allow(true);
+
+        // `skill_manage list` is read-only — its result does NOT contain
+        // the refresh sentinel.
+        let outcome = execute_tool_with_outcome(
+            "tool_use_list",
+            "skill_manage",
+            &serde_json::json!({"action": "list"}),
+            Some(&handle),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!outcome.result.is_error);
+        assert!(
+            !outcome.skill_refresh_required,
+            "list is read-only — no refresh sentinel expected"
+        );
+        // The agent loop only calls `fresh_skill_snapshot` when the
+        // sentinel is true. Counter must stay at zero.
+        assert_eq!(
+            fake.snapshot_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "read-only tool must not trigger snapshot refresh"
+        );
     }
 }

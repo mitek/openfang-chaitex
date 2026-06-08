@@ -455,6 +455,14 @@ pub async fn run_agent_loop(
     // EndTurn iteration has empty text).
     let mut accumulated_text = String::new();
 
+    // Plan 01-09: owned skill-registry snapshot for mid-turn refresh.
+    // Populated lazily after a tool result carries the
+    // `skill_refresh_required: true` sentinel (see plan 01-08). When
+    // `Some`, the next tool dispatch borrows from this fresh snapshot
+    // instead of the caller-provided `skill_registry` param so a patched
+    // skill is visible to the very next tool call in the same turn.
+    let mut fresh_snapshot: Option<SkillRegistry> = None;
+
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
     // the catastrophic case where 200+ messages cause instant context overflow.
@@ -923,17 +931,23 @@ pub async fn run_agent_loop(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
+                    // Plan 01-09: prefer the fresh post-mutation snapshot if
+                    // one has been captured this turn; otherwise fall back to
+                    // the caller-provided borrow.
+                    let active_skill_registry: Option<&SkillRegistry> =
+                        fresh_snapshot.as_ref().or(skill_registry);
+
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
                     let timeout_opt = tool_timeout_for(&tool_call.name);
-                    let exec_fut = tool_runner::execute_tool(
+                    let exec_fut = tool_runner::execute_tool_with_outcome(
                         &tool_call.id,
                         &tool_call.name,
                         &tool_call.input,
                         kernel.as_ref(),
                         Some(&allowed_tool_names),
                         Some(&caller_id_str),
-                        skill_registry,
+                        active_skill_registry,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
@@ -949,26 +963,47 @@ pub async fn run_agent_loop(
                         docker_config,
                         process_manager,
                     );
-                    let result = match timeout_opt {
+                    let outcome = match timeout_opt {
                         Some(timeout) => {
                             let timeout_secs = timeout.as_secs();
                             match tokio::time::timeout(timeout, exec_fut).await {
-                                Ok(result) => result,
+                                Ok(outcome) => outcome,
                                 Err(_) => {
                                     warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
-                                    openfang_types::tool::ToolResult {
-                                        tool_use_id: tool_call.id.clone(),
-                                        content: format!(
-                                            "Tool '{}' timed out after {}s.",
-                                            tool_call.name, timeout_secs
-                                        ),
-                                        is_error: true,
+                                    tool_runner::ToolOutcome {
+                                        result: openfang_types::tool::ToolResult {
+                                            tool_use_id: tool_call.id.clone(),
+                                            content: format!(
+                                                "Tool '{}' timed out after {}s.",
+                                                tool_call.name, timeout_secs
+                                            ),
+                                            is_error: true,
+                                        },
+                                        skill_refresh_required: false,
                                     }
                                 }
                             }
                         }
                         None => exec_fut.await,
                     };
+                    let result = outcome.result;
+
+                    // Plan 01-09: a mutation tool emitted the refresh
+                    // sentinel — pull a fresh registry snapshot so the
+                    // very next tool dispatch in this turn sees the
+                    // patched skill content. Falls back silently to the
+                    // existing snapshot if the kernel can't deliver one.
+                    if outcome.skill_refresh_required {
+                        if let Some(kh) = kernel.as_ref() {
+                            if let Some(snap) = kh.fresh_skill_snapshot() {
+                                debug!(
+                                    tool = %tool_call.name,
+                                    "Refreshed SkillRegistry snapshot after mutation"
+                                );
+                                fresh_snapshot = Some(snap);
+                            }
+                        }
+                    }
 
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
@@ -1676,6 +1711,10 @@ pub async fn run_agent_loop_streaming(
     let final_response;
     let mut accumulated_text = String::new();
 
+    // Plan 01-09: owned skill-registry snapshot for mid-turn refresh
+    // (streaming counterpart). See `run_agent_loop` for the rationale.
+    let mut fresh_snapshot: Option<SkillRegistry> = None;
+
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // Per-agent cap: manifest override -> runtime default (issue #871).
     let max_history = manifest.effective_max_history_messages();
@@ -2132,17 +2171,22 @@ pub async fn run_agent_loop_streaming(
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
+                    // Plan 01-09: prefer the fresh post-mutation snapshot if
+                    // one has been captured this turn (streaming counterpart).
+                    let active_skill_registry: Option<&SkillRegistry> =
+                        fresh_snapshot.as_ref().or(skill_registry);
+
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
                     let timeout_opt = tool_timeout_for(&tool_call.name);
-                    let exec_fut = tool_runner::execute_tool(
+                    let exec_fut = tool_runner::execute_tool_with_outcome(
                         &tool_call.id,
                         &tool_call.name,
                         &tool_call.input,
                         kernel.as_ref(),
                         Some(&allowed_tool_names),
                         Some(&caller_id_str),
-                        skill_registry,
+                        active_skill_registry,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
@@ -2158,26 +2202,44 @@ pub async fn run_agent_loop_streaming(
                         docker_config,
                         process_manager,
                     );
-                    let result = match timeout_opt {
+                    let outcome = match timeout_opt {
                         Some(timeout) => {
                             let timeout_secs = timeout.as_secs();
                             match tokio::time::timeout(timeout, exec_fut).await {
-                                Ok(result) => result,
+                                Ok(outcome) => outcome,
                                 Err(_) => {
                                     warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
-                                    openfang_types::tool::ToolResult {
-                                        tool_use_id: tool_call.id.clone(),
-                                        content: format!(
-                                            "Tool '{}' timed out after {}s.",
-                                            tool_call.name, timeout_secs
-                                        ),
-                                        is_error: true,
+                                    tool_runner::ToolOutcome {
+                                        result: openfang_types::tool::ToolResult {
+                                            tool_use_id: tool_call.id.clone(),
+                                            content: format!(
+                                                "Tool '{}' timed out after {}s.",
+                                                tool_call.name, timeout_secs
+                                            ),
+                                            is_error: true,
+                                        },
+                                        skill_refresh_required: false,
                                     }
                                 }
                             }
                         }
                         None => exec_fut.await,
                     };
+                    let result = outcome.result;
+
+                    // Plan 01-09: refresh the registry snapshot if a
+                    // mutation tool flagged it (streaming counterpart).
+                    if outcome.skill_refresh_required {
+                        if let Some(kh) = kernel.as_ref() {
+                            if let Some(snap) = kh.fresh_skill_snapshot() {
+                                debug!(
+                                    tool = %tool_call.name,
+                                    "Refreshed SkillRegistry snapshot after mutation (streaming)"
+                                );
+                                fresh_snapshot = Some(snap);
+                            }
+                        }
+                    }
 
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
