@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.6.9
 milestone_name: milestone
 status: executing
-last_updated: "2026-06-10T05:49:13.340Z"
+last_updated: "2026-06-10T12:00:00.000Z"
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 24
-  completed_plans: 20
-  percent: 83
+  completed_plans: 21
+  percent: 88
 ---
 
 # STATE
@@ -27,9 +27,9 @@ Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
 Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + Jaccard dedupe — Plan 05's worker can now call is_duplicate_candidate, create_draft_skill, approve_draft_skill, list_drafts). Wave 2 in progress: 01.1-05 (distillation queue + post-turn hook + background worker — COMPLETE).
-- **Status:** Executing Phase 01.1 — Wave 2
-- **Progress:** ▓▓▓▓▓▓░░░░ 62% — Wave 1 (plans 01-04) complete + plan 05 complete, Wave 2 remaining (06) next.
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker), 01.1-04 (draft-skill lifecycle + Jaccard dedupe). Wave 2 complete: 01.1-05 (distillation queue + post-turn hook + background worker), 01.1-06 (skill-failure recording, propose_skill_patch routing, memory-consolidation nudge).
+- **Status:** Executing Phase 01.1 — Wave 2 done, Wave 3 (API endpoints) next
+- **Progress:** ▓▓▓▓▓▓▓▓░░ 75% — 6/8 plans done (waves 1-2), Wave 3 (07) next.
 
 ## Performance metrics (Phase 1.1)
 
@@ -38,6 +38,7 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 - Plan 01.1-03: SkillFailureTracker; commit cb59887; 5 TDD tests; ~15 min
 - Plan 01.1-04: draft lifecycle + dedupe; commit 13a2e1c; 8 TDD tests; ~18 min
 - Plan 01.1-05: distillation queue + daily cap + post-turn hook + background worker; commits 60dc03b + e14e5b3; 3 files; 9 new tests; ~45 min
+- Plan 01.1-06: skill-failure recording + patch proposals + consolidation nudge; commits 066b75c/5c2a0ff/f05b240; 3 files; ~40 min
 
 ## Performance metrics
 
@@ -63,6 +64,14 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 - **Description quote-escaping in distilled skill TOML**: LLM answers may contain quotes; `replace('"', "'")` before embedding in TOML string literal prevents parse failures. Inline sanitization, no separate struct.
 - **distillation_cap_state pre-captured** before `config` is moved into the kernel struct literal — `DailyCapState::load(&sidecar_path(&config.home_dir))` runs before `Self { config, ... }`, captured into `distillation_cap_state` local.
 - **turn_start captured at top of execute_llm_agent** before quota check — measures true wall time including metering overhead. Placed immediately after the function body opens, before session load.
+
+### Decisions made during Phase 1.1 Plan 01.1-06 execution (2026-06-10)
+
+- **`propose_skill_patch` uses fail-safe protected logic** — missing skill OR `None` protected flag treated as `true` (protected). This prevents a newly-created skill without an explicit `protected` field from accidentally bypassing the approval gate.
+- **`ApprovalManager` is not Clone; spawned via upgraded self-Arc** — `tokio::spawn` fire-and-forget keeps the `ApprovalManager` alive without requiring it to be cloneable or wrapped in an extra `Arc`. Pattern applicable wherever a non-Clone kernel component needs to be used from a spawned task.
+- **Memory-consolidation nudge uses same persistence path as `memory_conclude` tool** — `load_profile`/`add_fact`/`save_profile` from `openfang_reasoning::profile`. This ensures the nudge's persisted facts appear in the same place as agent-triggered conclusions.
+- **Confidence threshold of 0.7 for nudge persistence** — below 0.7 the synthesis is too speculative to be worth persisting as a durable `UserFact`. Same bar as RESEARCH.md recommendation.
+- **Nudge uses `FactSource::MemoryReason { level: "medium" }` to mark auto-persisted facts** — distinguishes automated nudge output from agent-triggered `memory_conclude` calls in the profile audit trail.
 
 ### Decisions made during Phase 1.1 execution (2026-06-10)
 

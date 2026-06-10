@@ -493,7 +493,21 @@ pub async fn execute_tool(
         // Skill introspection tools (issue #1038)
         "skill_list" => tool_skill_list(skill_registry),
         "skill_describe" => tool_skill_describe(input, skill_registry),
-        "skill_execute" => tool_skill_execute(input, skill_registry).await,
+        "skill_execute" => {
+            let res = tool_skill_execute(input, skill_registry).await;
+            if let Err(ref err_msg) = res {
+                if let Some(skill_name) = input["skill"].as_str() {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    err_msg.hash(&mut h);
+                    let agent = caller_agent_id.unwrap_or("");
+                    if let Some(k) = kernel {
+                        k.record_skill_failure(skill_name.trim(), agent, h.finish());
+                    }
+                }
+            }
+            res
+        }
 
         // === PHASE 1 PLAN 01-08 skill_manage ===
         "skill_manage" => tool_skill_manage(input, kernel).await,
