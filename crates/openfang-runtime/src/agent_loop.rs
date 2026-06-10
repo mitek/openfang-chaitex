@@ -259,6 +259,18 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+    /// Phase 1.1 SD-01: number of failure-then-recovery events in this turn
+    /// (a tool error on one iteration followed by a non-error tool result on
+    /// a later iteration). Zero when the turn had no tool errors or never
+    /// recovered. Defaults to 0 for back-compat at all construction sites.
+    pub error_recovery_count: u32,
+}
+
+/// Returns true if a recovery event occurred this iteration (previous iteration
+/// had an error, this iteration did not).  Pure function, testable in isolation.
+/// Phase 1.1 SD-01.
+fn detect_recovery(prev_had_error: bool, this_has_error: bool) -> bool {
+    prev_had_error && !this_has_error
 }
 
 /// Build the user-turn message, combining text with any image content blocks.
@@ -510,6 +522,9 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // Phase 1.1 SD-01: error-recovery tracking
+    let mut error_recovery_count: u32 = 0u32;
+    let mut prev_iteration_had_error = false;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -631,6 +646,7 @@ pub async fn run_agent_loop(
                             current_thread: parsed_directives.current_thread,
                             silent: true,
                         },
+                        error_recovery_count: 0,
                     });
                 }
 
@@ -809,6 +825,7 @@ pub async fn run_agent_loop(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    error_recovery_count,
                 });
             }
             StopReason::ToolUse => {
@@ -1082,6 +1099,13 @@ pub async fn run_agent_loop(
                     });
                 }
 
+                // Phase 1.1 SD-01: track failure-then-recovery transitions
+                let this_iteration_had_error = non_denial_errors > 0;
+                if detect_recovery(prev_iteration_had_error, this_iteration_had_error) {
+                    error_recovery_count += 1;
+                }
+                prev_iteration_had_error = this_iteration_had_error;
+
                 // Add tool results as a user message (Anthropic API requirement)
                 let tool_results_msg = Message {
                     role: Role::User,
@@ -1140,6 +1164,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        error_recovery_count,
                     });
                 }
                 // Model hit token limit — add partial response and continue.
@@ -1760,6 +1785,9 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // Phase 1.1 SD-01: error-recovery tracking
+    let mut error_recovery_count: u32 = 0u32;
+    let mut prev_iteration_had_error = false;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1903,6 +1931,7 @@ pub async fn run_agent_loop_streaming(
                             current_thread: parsed_directives_s.current_thread,
                             silent: true,
                         },
+                        error_recovery_count: 0,
                     });
                 }
 
@@ -2056,6 +2085,7 @@ pub async fn run_agent_loop_streaming(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    error_recovery_count,
                 });
             }
             StopReason::ToolUse => {
@@ -2333,6 +2363,13 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
+                // Phase 1.1 SD-01: track failure-then-recovery transitions
+                let this_iteration_had_error = non_denial_errors > 0;
+                if detect_recovery(prev_iteration_had_error, this_iteration_had_error) {
+                    error_recovery_count += 1;
+                }
+                prev_iteration_had_error = this_iteration_had_error;
+
                 let tool_results_msg = Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_result_blocks.clone()),
@@ -2388,6 +2425,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        error_recovery_count,
                     });
                 }
                 // Issue #1148: preserve full response content (Thinking,
@@ -5551,5 +5589,25 @@ mod tests {
         assert!(!is_silent_token("Hello, how can I help?"));
         assert!(!is_silent_token("SILENT"));
         assert!(!is_silent_token(""));
+    }
+
+    // Phase 1.1 SD-01: error_recovery_count / detect_recovery tests
+
+    #[test]
+    fn error_recovery_counted() {
+        // prev had error, this does not → recovery event
+        assert!(detect_recovery(true, false));
+    }
+
+    #[test]
+    fn no_recovery_when_no_errors() {
+        // No errors at all → no recovery
+        assert!(!detect_recovery(false, false));
+    }
+
+    #[test]
+    fn repeated_errors_without_recovery() {
+        // Consecutive errors → no recovery (error→error is not a recovery)
+        assert!(!detect_recovery(true, true));
     }
 }
