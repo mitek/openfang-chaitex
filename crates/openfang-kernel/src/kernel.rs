@@ -8047,9 +8047,47 @@ impl KernelHandle for OpenFangKernel {
 
 impl OpenFangKernel {
     /// Phase 1.1 SI-02: raise a skill-patch proposal after repeated failures.
-    /// STUB — fully implemented in Plan 06 Task 2.
+    /// Protected skills require human approval (ApprovalManager); mutable
+    /// skills get a logged proposal the agent can act on. This method does
+    /// NOT itself mutate the skill — it surfaces the proposal. It is called
+    /// synchronously from record_skill_failure, so the (async, blocking)
+    /// approval call is spawned via the upgraded self-Arc.
     fn propose_skill_patch(&self, skill: &str, agent: &str) {
-        tracing::info!(skill, agent, "Skill patch proposal (stub — Task 2 implements routing)");
+        // CONFIRMED accessor: get() -> Option<&InstalledSkill>;
+        // manifest.skill.protected: Option<bool>. Missing skill OR None => protected (fail-safe).
+        let protected = {
+            let reg = self.skill_registry.read().unwrap_or_else(|e| e.into_inner());
+            reg.get(skill)
+                .map(|s| s.manifest.skill.protected.unwrap_or(true))
+                .unwrap_or(true)
+        };
+        if protected {
+            // ApprovalManager is not Clone; upgrade the self-Arc so the spawned
+            // task keeps the manager alive without cloning it.
+            let Some(kernel) = self.self_handle.get().and_then(|w| w.upgrade()) else {
+                tracing::warn!(skill, agent, "Cannot raise approval — self handle not set yet");
+                return;
+            };
+            let req = openfang_types::approval::ApprovalRequest {
+                id: uuid::Uuid::new_v4(),
+                agent_id: agent.to_string(),
+                tool_name: "skill_distillation_patch".to_string(),
+                description: format!(
+                    "Skill '{skill}' failed repeatedly. Approve generating a patch proposal for it?"
+                ),
+                action_summary: format!("propose patch for protected skill '{skill}'"),
+                risk_level: openfang_types::approval::RiskLevel::Low,
+                requested_at: chrono::Utc::now(),
+                timeout_secs: 300,
+            };
+            // request_approval(&self, ..) is async + blocking; fire-and-forget.
+            tokio::spawn(async move {
+                let _ = kernel.approval_manager.request_approval(req).await;
+            });
+            tracing::info!(skill, agent, "Protected skill patch proposal raised for approval");
+        } else {
+            tracing::info!(skill, agent, "Mutable skill patch proposal — agent may self-patch via skill_manage");
+        }
     }
 }
 
