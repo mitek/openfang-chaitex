@@ -27,7 +27,7 @@ Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
 Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + dedupe).
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + Jaccard dedupe — Plan 05's worker can now call is_duplicate_candidate, create_draft_skill, approve_draft_skill, list_drafts).
 - **Status:** Executing Phase 01.1
 - **Progress:** ▓▓▓▓▓░░░░░ 50% — Wave 1 (plans 01-04) complete, Wave 2 (05-06) next.
 
