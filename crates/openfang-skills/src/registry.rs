@@ -1084,6 +1084,77 @@ impl SkillRegistry {
     }
 }
 
+/// SD-06: normalized token-set similarity in [0.0, 1.0] (Jaccard over
+/// lowercased alphanumeric word sets). Pure — no LLM, no allocation beyond
+/// the sets. Both empty → 1.0 (identical). One empty → 0.0.
+fn description_similarity(a: &str, b: &str) -> f32 {
+    use std::collections::HashSet;
+    let norm = |s: &str| -> HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let sa = norm(a);
+    let sb = norm(b);
+    if sa.is_empty() && sb.is_empty() {
+        return 1.0;
+    }
+    let inter = sa.intersection(&sb).count() as f32;
+    let union = sa.union(&sb).count() as f32;
+    if union == 0.0 { 0.0 } else { inter / union }
+}
+
+impl SkillRegistry {
+    /// SD-06: true if a candidate distilled skill collides with an existing
+    /// skill by name OR by description similarity >= 0.85. Skills are NOT
+    /// FTS5-indexed; this is a name lookup + token-set heuristic.
+    pub fn is_duplicate_candidate(
+        &self,
+        candidate_name: &str,
+        candidate_description: &str,
+    ) -> bool {
+        if self.get(candidate_name).is_some() {
+            return true;
+        }
+        self.list_all().iter().any(|s| {
+            let existing_desc = &s.manifest.skill.description;
+            description_similarity(existing_desc, candidate_description) >= 0.85
+        })
+    }
+
+    /// SD-05: create a distilled skill as a DRAFT (enabled=false). Returns
+    /// Ok(true) if newly created, Ok(false) if a skill with this name already
+    /// existed (Pitfall 4 — duplicate name is skipped, not an error).
+    pub fn create_draft_skill(
+        &mut self,
+        name: &str,
+        toml_content: &str,
+        prompt_context: Option<&str>,
+    ) -> Result<bool, SkillError> {
+        match self.create_skill(name, toml_content, prompt_context, None) {
+            Ok(_) => {
+                self.set_skill_enabled(name, false)?;
+                Ok(true)
+            }
+            Err(SkillError::AlreadyInstalled(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// SD-05: approve a draft skill — flips enabled=true.
+    pub fn approve_draft_skill(&mut self, name: &str) -> Result<(), SkillError> {
+        self.set_skill_enabled(name, true)
+    }
+
+    /// SD-05: all draft (enabled=false) skills, for the
+    /// /api/distillation/drafts endpoint.
+    pub fn list_drafts(&self) -> Vec<&InstalledSkill> {
+        self.list_all().into_iter().filter(|s| !s.enabled).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,5 +2262,103 @@ input_schema = { type = "object" }
         crate::apply_load_time_defaults(&mut m, true);
         assert_eq!(m.skill.mutable, Some(true));
         assert_eq!(m.skill.protected, Some(true));
+    }
+
+    // ------------------------------------------------------------------
+    // SD-06 dedupe heuristic tests (plan 01.1-04)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dedupe_exact_name() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("foo", "some description");
+        reg.create_skill("foo", &toml, None, None).unwrap();
+        // Same name → duplicate regardless of description.
+        assert!(reg.is_duplicate_candidate("foo", "any description"));
+    }
+
+    #[test]
+    fn dedupe_similar_description() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("deploy-helper", "Deploys the app to staging");
+        reg.create_skill("deploy-helper", &toml, None, None).unwrap();
+        // Different name but near-identical description (trailing period).
+        assert!(
+            reg.is_duplicate_candidate("deploy-staging", "Deploys the app to staging."),
+            "trailing period should still be flagged as duplicate (high Jaccard similarity)"
+        );
+    }
+
+    #[test]
+    fn dedupe_distinct() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("deploy-helper", "Deploys the app to staging");
+        reg.create_skill("deploy-helper", &toml, None, None).unwrap();
+        // Clearly unrelated candidate.
+        assert!(!reg.is_duplicate_candidate("weather-fetch", "Fetches the weather forecast"));
+    }
+
+    #[test]
+    fn dedupe_empty_registry() {
+        let (_dir, reg, _, _) = fresh_registry();
+        assert!(!reg.is_duplicate_candidate("anything", "any description"));
+    }
+
+    // ------------------------------------------------------------------
+    // SD-05 draft lifecycle tests (plan 01.1-04)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn draft_created_disabled() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("distilled-x", "a distilled skill");
+        let result = reg.create_draft_skill("distilled-x", &toml, Some("# context")).unwrap();
+        assert!(result, "create_draft_skill must return Ok(true) for a new skill");
+        // Draft must be disabled.
+        assert!(!reg.get("distilled-x").unwrap().enabled);
+        // Must NOT appear in list() (enabled-only view).
+        assert!(reg.list().iter().all(|s| s.manifest.skill.name != "distilled-x"));
+        // Must appear in list_drafts().
+        assert!(reg.list_drafts().iter().any(|s| s.manifest.skill.name == "distilled-x"));
+    }
+
+    #[test]
+    fn draft_skill_approval() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("distilled-x", "a distilled skill");
+        reg.create_draft_skill("distilled-x", &toml, None).unwrap();
+        // Approve the draft.
+        reg.approve_draft_skill("distilled-x").unwrap();
+        // Must now be enabled.
+        assert!(reg.get("distilled-x").unwrap().enabled);
+        // Must appear in list().
+        assert!(reg.list().iter().any(|s| s.manifest.skill.name == "distilled-x"));
+    }
+
+    #[test]
+    fn create_draft_duplicate_name_skipped() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        let toml = skill_toml("distilled-x", "a distilled skill");
+        let first = reg.create_draft_skill("distilled-x", &toml, None).unwrap();
+        assert!(first, "first creation must return Ok(true)");
+        // Second creation with same name must NOT error — returns Ok(false).
+        let second = reg.create_draft_skill("distilled-x", &toml, None).unwrap();
+        assert!(!second, "duplicate name must return Ok(false), not Err");
+    }
+
+    #[test]
+    fn list_drafts_filters_enabled() {
+        let (_dir, mut reg, _, _) = fresh_registry();
+        // Create one enabled skill.
+        let toml_enabled = skill_toml("enabled-skill", "enabled");
+        reg.create_skill("enabled-skill", &toml_enabled, None, None).unwrap();
+        assert!(reg.get("enabled-skill").unwrap().enabled);
+        // Create one draft.
+        let toml_draft = skill_toml("draft-skill", "draft");
+        reg.create_draft_skill("draft-skill", &toml_draft, None).unwrap();
+        // list_drafts must return exactly 1 entry (the draft).
+        let drafts = reg.list_drafts();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].manifest.skill.name, "draft-skill");
     }
 }
