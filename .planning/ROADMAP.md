@@ -74,6 +74,39 @@ Tracked in [`01-CONTEXT.md`](phases/01-self-learning-core/01-CONTEXT.md). Top th
 
 ---
 
+## Phase 1.1 — Autonomous Skill Distillation Loop (INSERTED 2026-06-10)
+
+**Slug:** `01.1-autonomous-skill-distillation-loop`
+**Estimated effort:** 2-3 weeks
+**Status:** EXECUTING — 1/8 plans complete (01.1-01 done: DistillationConfig + requirements)
+
+### Goal
+
+Close the self-learning loop with autonomy wiring: post-task reflection → skill distillation, skill self-improvement on failure-then-recovery, cron-driven memory consolidation nudge. All loops run behind existing security gates and budget ceilings. Motivated by competitive analysis vs. Hermes Agent ("closed learning loop" headline feature); OpenFang differentiator is running the loop on existing infrastructure without new deps.
+
+### Requirements
+
+Defined in `REQUIREMENTS.md § Phase 1.1`. IDs: SD-01..06, SI-01..03, MC-01..02, X-01..02.
+
+### Plan progress
+
+| Plan | Name | Status |
+|------|------|--------|
+| 01.1-01 | DistillationConfig + Phase 1.1 requirements | DONE (e48dfca, fca9136) |
+| 01.1-02 | TurnStats + reflection scorer | not started |
+| 01.1-03 | DistillationJob queue + worker scaffold | not started |
+| 01.1-04 | Daily cap + distillation_state.json sidecar | not started |
+| 01.1-05 | Draft skill creation via create_skill path | not started |
+| 01.1-06 | SkillFailureTracker + SI loop | not started |
+| 01.1-07 | Memory consolidation nudge background task | not started |
+| 01.1-08 | Live integration + verification | not started |
+
+### Dependencies
+
+Phase 1 complete (ReasoningEngine, BudgetTracker, create_skill, ApprovalManager, memory_conclude all shipped).
+
+---
+
 ## Phase 2 — Tool Expansion
 
 **Slug:** `02-tool-expansion`

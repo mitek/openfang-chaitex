@@ -1,18 +1,35 @@
+---
+gsd_state_version: 1.0
+milestone: v0.6.9
+milestone_name: milestone
+status: executing
+last_updated: "2026-06-10T05:38:49Z"
+progress:
+  total_phases: 2
+  completed_phases: 1
+  total_plans: 24
+  completed_plans: 17
+  percent: 71
+---
+
 # STATE
 
-**Updated:** 2026-06-06
+**Updated:** 2026-06-10
 
 ## Project reference
 
 - **Core value:** self-learning agent OS that fits on pc162 (1.9 GB ARM).
-- **Current focus:** Phase 1 — Self-Learning Core (skill self-patching, FTS5 session search, memory reasoning).
+- **Current focus:** Phase 01.1 — autonomous-skill-distillation-loop
 
 ## Current position
 
+Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
+Plan: 2 of 8
+
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Wave:** all 5 waves shipped + W3.5 cross-cutting fix + UAT-found `b2b056d` daemon-start fix. 16/16 plans done.
-- **Status:** Phase 1 100% complete + signed off. Four new agent tools live and exercised end-to-end via DeepSeek: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green; 12/12 success criteria addressed (10 PASS, 1 PASS via unit tests with live deferred, 1 WIRED with documented UX follow-up).
-- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 02 (Tool Expansion) — currently unscoped, awaits inventory of which Hermes tools to bring across.
+- **Phase 01.1:** EXECUTING — 1/8 plans complete. Plan 01.1-01 done (DistillationConfig + Phase 1.1 requirements).
+- **Status:** Executing Phase 01.1
+- **Progress:** ▓▓▓▓▓▓▓▓▓▓ Phase 1 complete. Phase 1.1 executing (1/8 plans done).
 
 ## Performance metrics
 
@@ -27,6 +44,12 @@
 - Workspace state: clean `main`, HEAD = `64e5524`.
 
 ## Accumulated context
+
+### Decisions made during Phase 1.1 execution (2026-06-10)
+
+- **`DistillationConfig` uses `#[serde(default)]` without `deny_unknown_fields`** — per RESEARCH.md Pitfall 1 and requirement X-01. The `[distillation]` section must remain open so future plans can add fields without loud-degrading existing configs. Contrast with `[reasoning]` which intentionally uses `deny_unknown_fields` to catch typos.
+- **`DistillationConfig` derives `PartialEq`** — required by the `distillation_config_omitted_section_uses_defaults` test which uses `assert_eq!`. This is standard and does not add complexity.
+- **Phase 1.1 REQ-IDs X-01/X-02 are Phase 1.1-scoped** — distinct from Phase 1's X-01/X-02 (which cover tool registration touchpoints and capability flags). The ID prefix namespace is per-phase.
 
 ### Decisions made during W4 execution (2026-06-08)
 
