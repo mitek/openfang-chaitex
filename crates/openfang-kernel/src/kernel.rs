@@ -4709,6 +4709,28 @@ impl OpenFangKernel {
             }
         }
 
+        // Phase 1.1 MC-01: memory-consolidation nudge — periodically reasons over
+        // recent sessions and PERSISTS durable facts into each agent's profile.
+        // Charged via BudgetTracker on the ReasoningEngine (MC-02). NOT a user cron job.
+        {
+            let interval_hours = self.config.distillation.consolidation_nudge_hours;
+            if interval_hours > 0 {
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        interval_hours * 3600,
+                    ));
+                    interval.tick().await; // skip first tick (Pitfall 7: let set_self_handle run)
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() { break; }
+                        kernel.run_memory_consolidation_nudge().await;
+                    }
+                });
+                info!("Memory-consolidation nudge scheduled every {interval_hours} hour(s)");
+            }
+        }
+
         // Connect to configured + extension MCP servers
         let has_mcp = self
             .effective_mcp_servers
@@ -8087,6 +8109,76 @@ impl OpenFangKernel {
             tracing::info!(skill, agent, "Protected skill patch proposal raised for approval");
         } else {
             tracing::info!(skill, agent, "Mutable skill patch proposal — agent may self-patch via skill_manage");
+        }
+    }
+
+    /// MC-01/MC-02: run one consolidation nudge. For each registered agent,
+    /// reasons at Medium over its recent sessions and persists a high-confidence
+    /// synthesis into that agent's UserProfile (memory substrate). Cost is
+    /// enforced by the ReasoningEngine's BudgetTracker. On a missing engine OR
+    /// budget-exceeded outcome, skips the LLM call and logs INFO.
+    async fn run_memory_consolidation_nudge(self: &Arc<Self>) {
+        let Some(engine) = self.reasoning_engine.get().cloned() else {
+            tracing::info!("Consolidation nudge: reasoning engine not ready — skipping");
+            return;
+        };
+        // Snapshot the agent list (id + name) before any .await — no registry
+        // guard held across the reasoning call.
+        let agents: Vec<(openfang_types::agent::AgentId, String)> = self
+            .registry
+            .list()
+            .iter()
+            .map(|e| (e.id, e.name.clone()))
+            .collect();
+        for (agent_id, agent_name) in agents {
+            let req = openfang_reasoning::ReasoningQuery {
+                query: "Summarize any durable fact or user preference discovered \
+                        in this agent's recent sessions in one sentence. If nothing \
+                        durable was learned, reply exactly 'NONE'.".to_string(),
+                level: openfang_reasoning::ReasoningLevel::Medium,
+                agent_id: Some(agent_id),
+                max_facts: Some(30),
+            };
+            let result = match engine.reason(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::info!(agent = %agent_name, "Consolidation nudge skipped/failed: {e}");
+                    continue;
+                }
+            };
+            let answer = result.answer.trim().to_string();
+            if result.confidence < 0.7 || answer.is_empty() || answer.eq_ignore_ascii_case("none") {
+                tracing::debug!(agent = %agent_name, confidence = result.confidence,
+                    "Consolidation nudge: nothing durable to persist");
+                continue;
+            }
+            // MC-01 PERSIST: write the synthesized fact into the agent's profile
+            // using the same path as the memory_conclude tool. Best-effort —
+            // a write failure is WARN-logged and does not abort the loop.
+            // Never hold the substrate connection across an .await (sync helpers).
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut profile = match openfang_reasoning::profile::load_profile(&self.memory, &agent_id) {
+                Ok(p) => p,
+                Err(e) => { tracing::warn!(agent = %agent_name, "nudge load_profile failed: {e}"); continue; }
+            };
+            openfang_reasoning::profile::add_fact(
+                &mut profile,
+                openfang_reasoning::profile::UserFact {
+                    fact: answer.clone(),
+                    confidence: result.confidence,
+                    source: openfang_reasoning::profile::FactSource::MemoryReason {
+                        level: "medium".to_string(),
+                    },
+                    first_observed: now.clone(),
+                    last_confirmed: now,
+                },
+            );
+            if let Err(e) = openfang_reasoning::profile::save_profile(&self.memory, &agent_id, &mut profile) {
+                tracing::warn!(agent = %agent_name, "nudge save_profile failed: {e}");
+            } else {
+                tracing::info!(agent = %agent_name, confidence = result.confidence,
+                    "Consolidation nudge persisted a durable fact");
+            }
         }
     }
 }
