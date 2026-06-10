@@ -142,6 +142,10 @@ pub struct OpenFangKernel {
     pub cron_scheduler: crate::cron::CronScheduler,
     /// Execution approval manager.
     pub approval_manager: crate::approval::ApprovalManager,
+    /// Phase 1.1: bounded queue of pending skill-distillation jobs.
+    pub distillation_queue: std::sync::Arc<crate::distillation::DistillationQueue>,
+    /// Phase 1.1: persisted daily distillation cap counter.
+    pub distillation_cap: std::sync::Mutex<crate::distillation::DailyCapState>,
     /// Agent bindings for multi-account routing (Mutex for runtime add/remove).
     pub bindings: std::sync::Mutex<Vec<openfang_types::config::AgentBinding>>,
     /// Broadcast configuration.
@@ -1196,6 +1200,11 @@ impl OpenFangKernel {
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
 
+        // Phase 1.1: initialize distillation queue + load persisted daily cap.
+        let distillation_cap_state = crate::distillation::DailyCapState::load(
+            &crate::distillation::sidecar_path(&config.home_dir),
+        );
+
         let kernel = Self {
             config,
             // Direct boot_with_config bypasses file load — defaults to Ok.
@@ -1237,6 +1246,8 @@ impl OpenFangKernel {
             delivery_tracker: DeliveryTracker::new(),
             cron_scheduler,
             approval_manager,
+            distillation_queue: std::sync::Arc::new(crate::distillation::DistillationQueue::new()),
+            distillation_cap: std::sync::Mutex::new(distillation_cap_state),
             bindings: std::sync::Mutex::new(initial_bindings),
             broadcast: initial_broadcast,
             auto_reply_engine,
@@ -2697,6 +2708,9 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        // Phase 1.1 SD-02: capture turn start time for reflection score.
+        let turn_start = std::time::Instant::now();
+
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
@@ -3083,6 +3097,23 @@ impl OpenFangKernel {
             openfang_types::config::UsageFooterMode::Tokens => {
                 // Tokens are already in result.total_usage, omit cost
                 result.cost_usd = None;
+            }
+        }
+
+        // Phase 1.1 SD-02: post-turn reflection hook.
+        if self.config.distillation.enabled {
+            let stats = openfang_runtime::turn_stats::TurnStats::from_result(&result, turn_start.elapsed());
+            let cap_snapshot = self.distillation_cap.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let enqueued = crate::distillation::maybe_enqueue_distillation(
+                &agent_id.to_string(),
+                &session.id.to_string(),
+                &stats,
+                &self.config.distillation,
+                &cap_snapshot,
+                &self.distillation_queue,
+            );
+            if enqueued {
+                tracing::debug!(score = stats.reflection_score(), "Distillation job enqueued");
             }
         }
 
@@ -4704,6 +4735,42 @@ impl OpenFangKernel {
                 });
                 info!("Memory consolidation scheduled every {interval_hours} hour(s)");
             }
+        }
+
+        // Phase 1.1 SD-03: distillation worker — drains the job queue.
+        if self.config.distillation.enabled {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip first tick (let set_self_handle run — Pitfall 7)
+                loop {
+                    interval.tick().await;
+                    if kernel.supervisor.is_shutting_down() {
+                        break;
+                    }
+                    while let Some(job) = kernel.distillation_queue.pop() {
+                        // Re-check the daily cap right before doing work.
+                        let allowed = {
+                            let cap = kernel.distillation_cap.lock().unwrap_or_else(|e| e.into_inner());
+                            cap.can_distill(kernel.config.distillation.daily_cap)
+                        };
+                        if !allowed {
+                            tracing::info!("Daily distillation cap reached — draining remaining jobs without distilling");
+                            continue;
+                        }
+                        crate::distillation::run_distillation_job(&kernel, job).await;
+                        // Increment + persist the cap.
+                        // NOTE: guard is acquired AFTER the await — no guard held across .await.
+                        let path = crate::distillation::sidecar_path(&kernel.config.home_dir);
+                        let mut cap = kernel.distillation_cap.lock().unwrap_or_else(|e| e.into_inner());
+                        cap.increment();
+                        if let Err(e) = cap.save(&path) {
+                            tracing::warn!("Failed to persist distillation cap: {e}");
+                        }
+                    }
+                }
+            });
+            info!("Distillation worker started (daily cap {})", self.config.distillation.daily_cap);
         }
 
         // Connect to configured + extension MCP servers
