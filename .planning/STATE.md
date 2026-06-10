@@ -24,12 +24,19 @@ progress:
 ## Current position
 
 Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
-Plan: 2 of 8
+Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — 1/8 plans complete. Plan 01.1-01 done (DistillationConfig + Phase 1.1 requirements).
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker), 01.1-04 (draft-skill lifecycle + dedupe).
 - **Status:** Executing Phase 01.1
-- **Progress:** ▓▓▓▓▓▓▓▓▓▓ Phase 1 complete. Phase 1.1 executing (1/8 plans done).
+- **Progress:** ▓▓▓▓▓░░░░░ 50% — Wave 1 (plans 01-04) complete, Wave 2 (05-06) next.
+
+## Performance metrics (Phase 1.1)
+
+- Plan 01.1-01: DistillationConfig + Phase 1.1 requirements; commits d8c0c52/e48dfca/fca9136; 3 TDD tests; ~6.5 min
+- Plan 01.1-02: TurnStats + error_recovery_count; commits c812f7c + dd5612e; 5 files; 7 new tests; ~25 min
+- Plan 01.1-03: SkillFailureTracker; commit cb59887; 5 TDD tests; ~15 min
+- Plan 01.1-04: draft lifecycle + dedupe; commit 13a2e1c; 8 TDD tests; ~18 min
 
 ## Performance metrics
 
@@ -54,6 +61,10 @@ Plan: 2 of 8
 - **`DistillationConfig` uses `#[serde(default)]` without `deny_unknown_fields`** — per RESEARCH.md Pitfall 1 and requirement X-01. The `[distillation]` section must remain open so future plans can add fields without loud-degrading existing configs. Contrast with `[reasoning]` which intentionally uses `deny_unknown_fields` to catch typos.
 - **`DistillationConfig` derives `PartialEq`** — required by the `distillation_config_omitted_section_uses_defaults` test which uses `assert_eq!`. This is standard and does not add complexity.
 - **Phase 1.1 REQ-IDs X-01/X-02 are Phase 1.1-scoped** — distinct from Phase 1's X-01/X-02 (which cover tool registration touchpoints and capability flags). The ID prefix namespace is per-phase.
+- **`TurnStats::reflection_score()` weights: 0.45 iterations + 0.40 recovery + 0.15 tokens.** Recovery (error→non-error transition) is the strongest distillation signal; multi-step depth is primary. Token count is a weak secondary. All three signals normalized to [0,1] before weighting; result clamped to [0.0,1.0]. Implementation is pure Rust, no I/O, safe on pc162 hook path.
+- **`detect_recovery(prev_had_error, this_has_error) -> bool` extracted as standalone pure fn.** Allows unit tests to directly verify the transition logic without an async loop harness. Pattern: pure helper extraction for loop-body logic that needs deterministic testing.
+- **`error_recovery_count: 0` default at all early-exit/non-tool AgentLoopResult sites** (silent, MaxContinuations exit, WASM executor, Python executor, CLI daemon-fallback). Real accumulator value only populated at EndTurn and MaxContinuations returns where the ToolUse path was traversed at least once. Reasoning: early exits never reach the tool-execution path, so no recovery events are possible.
+- **openfang-cli AgentLoopResult sites updated despite CLAUDE.md "don't touch"** (Rule 3 — blocking compile issue). The struct field addition made CLI non-compilable. Fix: added `error_recovery_count: 0` to two sites in `event.rs`. No logic change.
 
 ### Decisions made during W4 execution (2026-06-08)
 
@@ -125,7 +136,13 @@ None.
 
 ## Session continuity
 
-- Local repo: `/Users/dshilov/openfang-chaitex` on `main`, HEAD = `1c6c5e2`.
+- Local repo: worktree `agent-a2a7be3f9bd4d952f` on `worktree-agent-a2a7be3f9bd4d952f`, HEAD = `dd5612e` (2026-06-10).
+- Last session stopped at: completed `01.1-02-PLAN.md` (TurnStats + error_recovery_count)
+- Phase 1.1 commits so far:
+  - `c812f7c feat(01.1-02): add error_recovery_count to AgentLoopResult + loop tracking`
+  - `dd5612e feat(01.1-02): TurnStats struct + reflection_score heuristic`
+
+- Historical (Phase 1): Local repo: `/Users/dshilov/openfang-chaitex` on `main`, HEAD = `1c6c5e2`.
 - Daemon: not running. Live integration tests at plan 01-16 will require `openfang start` with `GROQ_API_KEY`.
 - W1 commits (chronological, oldest first):
   - `15d6a1a feat(01-01): session_fts module with stable flattener + fts5 probe`

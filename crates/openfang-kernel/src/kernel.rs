@@ -2620,6 +2620,7 @@ impl OpenFangKernel {
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            error_recovery_count: 0,
         })
     }
 
@@ -2680,6 +2681,7 @@ impl OpenFangKernel {
             iterations: 1,
             silent: false,
             directives: Default::default(),
+            error_recovery_count: 0,
         })
     }
 

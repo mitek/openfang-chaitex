@@ -12,7 +12,7 @@ Three sequential phases extend OpenFang with self-learning capabilities to close
 | # | Phase | Status | Started | Completed |
 |---|-------|--------|---------|-----------|
 | 1 | Self-Learning Core | ✅ shipped + signed off | 2026-06-06 | 2026-06-08 |
-| 1.1 | Autonomous Skill Distillation Loop (INSERTED) | not started | — | — |
+| 1.1 | Autonomous Skill Distillation Loop (INSERTED) | in progress (4/8 plans) | 2026-06-10 | — |
 | 2 | Tool Expansion | not started | — | — |
 | 3 | Coordination | not started | — | — |
 
@@ -75,6 +75,7 @@ Tracked in [`01-CONTEXT.md`](phases/01-self-learning-core/01-CONTEXT.md). Top th
 
 ---
 
+<<<<<<< HEAD
 ## Phase 1.1: Autonomous Skill Distillation Loop (INSERTED)
 
 **Slug:** `01.1-autonomous-skill-distillation-loop`
@@ -109,9 +110,9 @@ This is Hermes Agent's headline feature ("the agent that grows with you" — aut
 
 Plans:
 - [x] 01.1-01-PLAN.md — [distillation] config section + Phase 1.1 requirements in REQUIREMENTS.md (X-01, X-02) [wave 1] — DONE (e48dfca, fca9136)
-- [ ] 01.1-02-PLAN.md — TurnStats + reflection_score heuristic + AgentLoopResult.error_recovery_count (SD-01, SD-02) [wave 1]
-- [ ] 01.1-03-PLAN.md — SkillFailureTracker (bounded, TTL-decaying) (SI-01, SI-03) [wave 1]
-- [ ] 01.1-04-PLAN.md — Draft-skill lifecycle helpers + dedupe in SkillRegistry (SD-05, SD-06) [wave 1]
+- [x] 01.1-02-PLAN.md — TurnStats + reflection_score heuristic + AgentLoopResult.error_recovery_count (SD-01, SD-02) [wave 1] — DONE (c812f7c, dd5612e)
+- [x] 01.1-03-PLAN.md — SkillFailureTracker (bounded, TTL-decaying) (SI-01, SI-03) [wave 1] — DONE (cb59887)
+- [x] 01.1-04-PLAN.md — Draft-skill lifecycle helpers + dedupe in SkillRegistry (SD-05, SD-06) [wave 1] — DONE (13a2e1c)
 - [ ] 01.1-05-PLAN.md — DistillationQueue + worker + post-turn hook + daily-cap sidecar (SD-02, SD-03, SD-04) [wave 2]
 - [ ] 01.1-06-PLAN.md — Skill-failure recording + patch proposals + memory-consolidation nudge (SI-01, SI-02, MC-01, MC-02) [wave 2]
 - [ ] 01.1-07-PLAN.md — /api/distillation/drafts list + approve endpoints (X-03) [wave 3]
