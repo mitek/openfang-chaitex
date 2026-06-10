@@ -5012,4 +5012,50 @@ shell_env_passthrough = ["*"]
         let cfg: KernelConfig = toml::from_str(toml_in).unwrap();
         assert!(cfg.capabilities.allow_skill_mutation);
     }
+
+    #[test]
+    fn distillation_config_parses_explicit_values() {
+        // SD-X-01: a [distillation] TOML block with all fields set deserializes correctly.
+        let toml_in = "\
+enabled = true\n\
+reflection_threshold = 0.6\n\
+daily_cap = 5\n\
+auto_approve_non_protected = false\n\
+consolidation_nudge_hours = 6\n\
+failure_patch_threshold = 3\n";
+        let cfg: DistillationConfig = toml::from_str(toml_in).unwrap();
+        assert!(cfg.enabled);
+        assert!((cfg.reflection_threshold - 0.6_f32).abs() < 1e-6);
+        assert_eq!(cfg.daily_cap, 5);
+        assert!(!cfg.auto_approve_non_protected);
+        assert_eq!(cfg.consolidation_nudge_hours, 6);
+        assert_eq!(cfg.failure_patch_threshold, 3);
+    }
+
+    #[test]
+    fn kernel_config_default_distillation() {
+        // SD-X-02: KernelConfig::default().distillation matches DistillationConfig::default().
+        let cfg = KernelConfig::default();
+        let d = &cfg.distillation;
+        assert!(!d.enabled);
+        assert!((d.reflection_threshold - 0.5_f32).abs() < 1e-6);
+        assert_eq!(d.daily_cap, 10);
+        assert!(!d.auto_approve_non_protected);
+        assert_eq!(d.consolidation_nudge_hours, 0);
+        assert_eq!(d.failure_patch_threshold, 3);
+    }
+
+    #[test]
+    fn distillation_config_omitted_section_uses_defaults() {
+        // SD-X-03: if the TOML document has no [distillation] block, the field
+        // defaults via `#[serde(default)]`.
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            distillation: DistillationConfig,
+        }
+        let cfg: Wrapper = toml::from_str("").unwrap();
+        let d = cfg.distillation;
+        assert_eq!(d, DistillationConfig::default());
+    }
 }
