@@ -112,7 +112,7 @@ Plans:
 - [x] 01.1-02-PLAN.md — TurnStats + reflection_score heuristic + AgentLoopResult.error_recovery_count (SD-01, SD-02) [wave 1] — DONE (c812f7c, dd5612e)
 - [x] 01.1-03-PLAN.md — SkillFailureTracker (bounded, TTL-decaying) (SI-01, SI-03) [wave 1] — DONE (cb59887)
 - [x] 01.1-04-PLAN.md — Draft-skill lifecycle helpers + dedupe in SkillRegistry (SD-05, SD-06) [wave 1] — DONE (13a2e1c)
-- [ ] 01.1-05-PLAN.md — DistillationQueue + worker + post-turn hook + daily-cap sidecar (SD-02, SD-03, SD-04) [wave 2]
+- [x] 01.1-05-PLAN.md — DistillationQueue + worker + post-turn hook + daily-cap sidecar (SD-02, SD-03, SD-04) [wave 2] — DONE (60dc03b, e14e5b3)
 - [ ] 01.1-06-PLAN.md — Skill-failure recording + patch proposals + memory-consolidation nudge (SI-01, SI-02, MC-01, MC-02) [wave 2]
 - [ ] 01.1-07-PLAN.md — /api/distillation/drafts list + approve endpoints (X-03) [wave 3]
 - [ ] 01.1-08-PLAN.md — Workspace gates + CHANGELOG + live integration UAT (X-04, X-05, X-06) [wave 4]

@@ -27,9 +27,9 @@ Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
 Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + Jaccard dedupe — Plan 05's worker can now call is_duplicate_candidate, create_draft_skill, approve_draft_skill, list_drafts).
-- **Status:** Executing Phase 01.1
-- **Progress:** ▓▓▓▓▓░░░░░ 50% — Wave 1 (plans 01-04) complete, Wave 2 (05-06) next.
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + Jaccard dedupe — Plan 05's worker can now call is_duplicate_candidate, create_draft_skill, approve_draft_skill, list_drafts). Wave 2 in progress: 01.1-05 (distillation queue + post-turn hook + background worker — COMPLETE).
+- **Status:** Executing Phase 01.1 — Wave 2
+- **Progress:** ▓▓▓▓▓▓░░░░ 62% — Wave 1 (plans 01-04) complete + plan 05 complete, Wave 2 remaining (06) next.
 
 ## Performance metrics (Phase 1.1)
 
@@ -37,6 +37,7 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 - Plan 01.1-02: TurnStats + error_recovery_count; commits c812f7c + dd5612e; 5 files; 7 new tests; ~25 min
 - Plan 01.1-03: SkillFailureTracker; commit cb59887; 5 TDD tests; ~15 min
 - Plan 01.1-04: draft lifecycle + dedupe; commit 13a2e1c; 8 TDD tests; ~18 min
+- Plan 01.1-05: distillation queue + daily cap + post-turn hook + background worker; commits 60dc03b + e14e5b3; 3 files; 9 new tests; ~45 min
 
 ## Performance metrics
 
@@ -55,6 +56,13 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 ### Roadmap Evolution
 
 - Phase 1.1 inserted after Phase 1 (2026-06-10): Autonomous Skill Distillation Loop — close the self-learning loop with autonomy wiring (post-task reflection → skill distillation, skill self-improvement on failure-then-recovery, cron-driven memory consolidation) over Phase 1 mechanisms (`skill_manage`, FTS5, `memory_reason`, `memory_conclude`, BudgetTracker). Motivated by competitive analysis vs. Hermes Agent (its headline "closed learning loop" feature); OpenFang differentiator is running the loop behind existing security gates + budget ceilings. (INSERTED)
+
+### Decisions made during Phase 1.1 plan 05 execution (2026-06-10)
+
+- **TOML template for distilled skills** uses `[runtime] type = "promptonly"` + `[[tools.provided]]` — minimum valid manifest required by SkillManifest deserialization and create_skill. The plan's proposed template was missing these sections. The skill_toml helper in registry tests is the canonical reference for the minimum format.
+- **Description quote-escaping in distilled skill TOML**: LLM answers may contain quotes; `replace('"', "'")` before embedding in TOML string literal prevents parse failures. Inline sanitization, no separate struct.
+- **distillation_cap_state pre-captured** before `config` is moved into the kernel struct literal — `DailyCapState::load(&sidecar_path(&config.home_dir))` runs before `Self { config, ... }`, captured into `distillation_cap_state` local.
+- **turn_start captured at top of execute_llm_agent** before quota check — measures true wall time including metering overhead. Placed immediately after the function body opens, before session load.
 
 ### Decisions made during Phase 1.1 execution (2026-06-10)
 
