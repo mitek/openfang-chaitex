@@ -205,6 +205,8 @@ pub struct OpenFangKernel {
     /// its shutdown.
     pub reasoning_engine:
         OnceLock<Arc<openfang_reasoning::ReasoningEngine>>,
+    /// Phase 1.1 SI-01: tracks repeated skill_execute failures.
+    pub skill_failure_tracker: crate::skill_failure::SkillFailureTracker,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1254,6 +1256,7 @@ impl OpenFangKernel {
             skill_updated_tx: crate::skill_adapters::new_skill_updated_channel(),
             budget_tracker: OnceLock::new(),
             reasoning_engine: OnceLock::new(),
+            skill_failure_tracker: crate::skill_failure::SkillFailureTracker::new(),
         };
 
         // Wire HAND.toml load events into the Merkle audit chain so reload
@@ -8027,6 +8030,26 @@ impl KernelHandle for OpenFangKernel {
 
     fn reasoning_config(&self) -> Option<openfang_types::config::ReasoningConfig> {
         Some(self.config.reasoning.clone())
+    }
+
+    fn record_skill_failure(&self, skill: &str, agent: &str, error_hash: u64) {
+        self.skill_failure_tracker.record_failure(skill, agent, error_hash);
+        // SI-02: check threshold and propose a patch if reached.
+        let threshold = self.config.distillation.failure_patch_threshold;
+        if threshold > 0 && self.skill_failure_tracker.reached_threshold(skill, agent, threshold) {
+            self.propose_skill_patch(skill, agent);
+            self.skill_failure_tracker.clear(skill, agent);
+        }
+    }
+}
+
+// --- Phase 1.1 SI-02: propose_skill_patch + MC-01/MC-02 consolidation nudge ---
+
+impl OpenFangKernel {
+    /// Phase 1.1 SI-02: raise a skill-patch proposal after repeated failures.
+    /// STUB — fully implemented in Plan 06 Task 2.
+    fn propose_skill_patch(&self, skill: &str, agent: &str) {
+        tracing::info!(skill, agent, "Skill patch proposal (stub — Task 2 implements routing)");
     }
 }
 

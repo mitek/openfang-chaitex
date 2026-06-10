@@ -332,6 +332,12 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// Phase 1.1 SI-01: record a skill_execute failure for the autonomous
+    /// skill-improvement loop. Default no-op for test fakes / kernels that
+    /// do not track failures. `error_hash` is a stable hash of the error
+    /// message so the patch logic can detect a *repeated* failure pattern.
+    fn record_skill_failure(&self, _skill: &str, _agent: &str, _error_hash: u64) {}
+
     /// FTS5 search across stored session messages (plan 01-04).
     ///
     /// Wraps `openfang_memory::session::SessionStore::search_sessions_fts` so
