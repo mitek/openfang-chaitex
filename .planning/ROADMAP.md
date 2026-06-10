@@ -79,7 +79,7 @@ Tracked in [`01-CONTEXT.md`](phases/01-self-learning-core/01-CONTEXT.md). Top th
 
 **Slug:** `01.1-autonomous-skill-distillation-loop`
 **Estimated effort:** TBD (to be locked during planning)
-**Status:** not started — inserted 2026-06-10 after competitive analysis vs. Hermes Agent.
+**Status:** EXECUTING — inserted 2026-06-10 after competitive analysis vs. Hermes Agent.
 
 ### Goal
 
@@ -108,7 +108,7 @@ This is Hermes Agent's headline feature ("the agent that grows with you" — aut
 **Plans:** 8 plans in 4 waves
 
 Plans:
-- [ ] 01.1-01-PLAN.md — [distillation] config section + Phase 1.1 requirements in REQUIREMENTS.md (X-01, X-02) [wave 1]
+- [x] 01.1-01-PLAN.md — [distillation] config section + Phase 1.1 requirements in REQUIREMENTS.md (X-01, X-02) [wave 1] — DONE (e48dfca, fca9136)
 - [ ] 01.1-02-PLAN.md — TurnStats + reflection_score heuristic + AgentLoopResult.error_recovery_count (SD-01, SD-02) [wave 1]
 - [ ] 01.1-03-PLAN.md — SkillFailureTracker (bounded, TTL-decaying) (SI-01, SI-03) [wave 1]
 - [ ] 01.1-04-PLAN.md — Draft-skill lifecycle helpers + dedupe in SkillRegistry (SD-05, SD-06) [wave 1]

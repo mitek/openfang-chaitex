@@ -107,3 +107,60 @@
 | 12 | CHANGELOG entry present with schema-v9 backward-compat note | X-04 |
 
 These twelve criteria become the Phase 1 verification checklist consumed by `gsd:verify-work`.
+
+---
+
+## Phase 1.1: Autonomous Skill Distillation Loop
+
+**Scope:** Adds three autonomous loops on top of the Phase 1 mechanisms: post-turn reflection → skill distillation, skill self-improvement on failure-then-recovery, and cron-driven memory consolidation nudge. All loops are opt-in via `[distillation]` config and run behind existing security gates and budget ceilings.
+
+### Skill Distillation (SD-*)
+
+**SD-01.** Post-turn reflection scorer computes a `TurnStats` value (iterations/tool-call count, error-recovery count, total tokens, wall-clock ms) from `AgentLoopResult` data available at `kernel.rs:3033`. `AgentLoopResult` gains a `error_recovery_count: u32` field populated by the agent loop on each error-then-retry sequence.
+
+**SD-02.** A pure-heuristic `reflection_score()` (no LLM) maps `TurnStats` to a [0.0, 1.0] score; turns at/above `distillation.reflection_threshold` enqueue a `DistillationJob` on a bounded in-memory queue (VecDeque, cap 50, drops oldest when full). Queue is non-blocking — a slow worker never stalls an agent turn.
+
+**SD-03.** A distillation worker dequeues jobs, calls `ReasoningEngine::reason(query, Medium)` to judge whether a reusable procedure was discovered, and on confidence above threshold creates a draft skill via the existing `create_skill` path (injection scan + SHA256 + audit).
+
+**SD-04.** A daily distillation cap (`distillation.daily_cap`, UTC calendar day) is enforced and the counter persists across daemon restarts via a JSON sidecar `~/.openfang/distillation_state.json` (atomic write); the counter resets when the stored date != today. `daily_cap = 0` disables distillation.
+
+**SD-05.** Draft skills are created disabled (`enabled = false` via `set_skill_enabled`); approval flips them to `enabled = true`. Protected-skill gates are unchanged. When `distillation.auto_approve_non_protected = true`, non-protected drafts are enabled immediately upon creation.
+
+**SD-06.** Before creating a draft, candidate skills are deduplicated by registry name lookup (`registry.get(name).is_some()`) plus a description-similarity heuristic; skills are NOT FTS5-indexed so no FTS5 dedupe is attempted. If a matching skill already exists, the job is discarded and a DEBUG log is emitted.
+
+### Skill Self-Improvement (SI-*)
+
+**SI-01.** When `skill_execute` returns `is_error = true`, the event is recorded in a kernel-global `SkillFailureTracker` keyed by `(skill_name, agent_id)`. The tracker records the timestamp and error hash for each failure event.
+
+**SI-02.** When the same skill's failure pattern repeats `distillation.failure_patch_threshold` times (default 3) within the TTL window, a `skill_manage(patch)` proposal is raised: a direct patch path for mutable skills, an `ApprovalManager` request for protected skills. The patch proposal includes the error history as context.
+
+**SI-03.** `SkillFailureTracker` is bounded (max 20 events per key) and decays (entries older than a configurable TTL, default 7 days, dropped on insert) to prevent stale counts from driving spurious patches. The tracker lives in kernel memory only — no persistence required.
+
+### Memory Consolidation Nudge (MC-*)
+
+**MC-01.** A kernel-internal background task (`tokio::spawn` in `start_background_tasks`, modeled on the `memory.consolidate()` loop at `kernel.rs:4671`) runs memory consolidation on the `distillation.consolidation_nudge_hours` interval (0 = disabled). This is NOT a user-facing cron job.
+
+**MC-02.** The consolidation nudge invokes reasoning/profile helpers directly; all LLM cost is charged through the existing `BudgetTracker`, and `budget_exceeded_action` (warn-downgrade / block) is respected — on budget exceeded the task skips the LLM call and logs at INFO.
+
+### Cross-cutting (X-*)
+
+**X-01.** New `[distillation]` config section (`enabled`, `reflection_threshold`, `daily_cap`, `auto_approve_non_protected`, `consolidation_nudge_hours`, `failure_patch_threshold`) WITHOUT `deny_unknown_fields`. Lives in its own top-level TOML section, separate from `[reasoning]` which already uses `deny_unknown_fields` and would loud-degrade on unknown keys.
+
+**X-02.** All config fields added to `KernelConfig` struct and its `Default` impl (CLAUDE.md mandatory requirement). `DistillationConfig` defaults: `enabled=false`, `reflection_threshold=0.5`, `daily_cap=10`, `auto_approve_non_protected=false`, `consolidation_nudge_hours=0`, `failure_patch_threshold=3`.
+
+---
+
+### Mapping to Phase 1.1 success criteria (goal-backward)
+
+| # | Must be TRUE | Covers REQ-IDs |
+|---|--------------|----------------|
+| 1 | After a multi-tool agent turn, a draft skill appears in the registry (disabled) and can be queried via `skill_manage(list)` | SD-01, SD-02, SD-03, SD-05 |
+| 2 | Draft skill for a non-protected name with `auto_approve_non_protected=true` is created enabled (no approval step) | SD-05 |
+| 3 | Protected-skill failure repeating 3× within TTL raises an `ApprovalManager` request (not a direct patch) | SI-01, SI-02 |
+| 4 | Mutable-skill failure repeating 3× within TTL creates a direct patch without approval | SI-01, SI-02 |
+| 5 | Daily cap enforced: after `daily_cap` distillations, further jobs are discarded; cap counter survives daemon restart | SD-04 |
+| 6 | `SkillFailureTracker` never exceeds 20 events per key; events older than 7 days are dropped on insert | SI-03 |
+| 7 | Memory consolidation nudge fires on the configured interval, charges cost to BudgetTracker | MC-01, MC-02 |
+| 8 | When budget exceeded, consolidation nudge skips LLM call and logs INFO; does not error/crash | MC-02 |
+| 9 | Workspace gates pass: `cargo build --workspace --lib`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` | X-01, X-02 |
+| 10 | Live integration test: start daemon, run multi-tool agent turn, verify draft skill appears; approve it and verify `enabled=true` | SD-01, SD-03, SD-05 |

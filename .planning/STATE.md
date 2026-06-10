@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v0.6.9
 milestone_name: milestone
 status: executing
-last_updated: "2026-06-10T05:31:12.945Z"
+last_updated: "2026-06-10T05:38:49Z"
 progress:
-  total_phases: 1
-  completed_phases: 0
-  total_plans: 8
-  completed_plans: 0
-  percent: 100
+  total_phases: 2
+  completed_phases: 1
+  total_plans: 24
+  completed_plans: 17
+  percent: 71
 ---
 
 # STATE
 
-**Updated:** 2026-06-06
+**Updated:** 2026-06-10
 
 ## Project reference
 
@@ -24,12 +24,12 @@ progress:
 ## Current position
 
 Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
-Plan: 1 of 8
+Plan: 2 of 8
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Wave:** all 5 waves shipped + W3.5 cross-cutting fix + UAT-found `b2b056d` daemon-start fix. 16/16 plans done.
+- **Phase 01.1:** EXECUTING — 1/8 plans complete. Plan 01.1-01 done (DistillationConfig + Phase 1.1 requirements).
 - **Status:** Executing Phase 01.1
-- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 1.1 (Autonomous Skill Distillation Loop, INSERTED 2026-06-10) — then 02 (Tool Expansion, currently unscoped).
+- **Progress:** ▓▓▓▓▓▓▓▓▓▓ Phase 1 complete. Phase 1.1 executing (1/8 plans done).
 
 ## Performance metrics
 
@@ -48,6 +48,14 @@ Plan: 1 of 8
 ### Roadmap Evolution
 
 - Phase 1.1 inserted after Phase 1 (2026-06-10): Autonomous Skill Distillation Loop — close the self-learning loop with autonomy wiring (post-task reflection → skill distillation, skill self-improvement on failure-then-recovery, cron-driven memory consolidation) over Phase 1 mechanisms (`skill_manage`, FTS5, `memory_reason`, `memory_conclude`, BudgetTracker). Motivated by competitive analysis vs. Hermes Agent (its headline "closed learning loop" feature); OpenFang differentiator is running the loop behind existing security gates + budget ceilings. (INSERTED)
+
+### Decisions made during Phase 1.1 execution (2026-06-10)
+
+- **`DistillationConfig` uses `#[serde(default)]` without `deny_unknown_fields`** — per RESEARCH.md Pitfall 1 and requirement X-01. The `[distillation]` section must remain open so future plans can add fields without loud-degrading existing configs. Contrast with `[reasoning]` which intentionally uses `deny_unknown_fields` to catch typos.
+- **`DistillationConfig` derives `PartialEq`** — required by the `distillation_config_omitted_section_uses_defaults` test which uses `assert_eq!`. This is standard and does not add complexity.
+- **Phase 1.1 REQ-IDs X-01/X-02 are Phase 1.1-scoped** — distinct from Phase 1's X-01/X-02 (which cover tool registration touchpoints and capability flags). The ID prefix namespace is per-phase.
+
+### Decisions made during W4 execution (2026-06-08)
 
 - **`SessionStore::search_sessions_fts` is the canonical FTS5 query path.** Plan 01-04 lifted the SQL from `openfang-reasoning::fact_retrieval::fts5_session_search`; `fact_retrieval` now delegates to the memory-crate method. Single source of truth for FTS5 BM25 + snippet rendering. The `SessionSearchHit` struct lives in `openfang-memory`.
 - **`execute_tool -> ToolResult` signature preserved**, parallel `execute_tool_with_outcome -> ToolOutcome` wrapper added by plan 01-09. The agent loop migrated to the new wrapper; ~15 existing test sites and the `openfang-api` route continue using the legacy signature with no behavior change. Zero downstream blast radius. Pragmatic deviation from the plan's literal "promote at all call sites" wording.

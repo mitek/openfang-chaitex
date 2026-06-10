@@ -735,6 +735,52 @@ pub struct KernelCapabilities {
     pub allow_skill_mutation: bool,
 }
 
+/// Configuration for the Phase 1.1 autonomous skill distillation loop.
+///
+/// Lives in its own `[distillation]` TOML section — deliberately NOT part
+/// of `[reasoning]`, which uses `deny_unknown_fields` and would loud-degrade
+/// on unknown keys. All loops default OFF (`enabled=false`,
+/// `consolidation_nudge_hours=0`) so the feature is opt-in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistillationConfig {
+    /// Master switch for the post-turn reflection hook and distillation worker.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Reflection score in [0.0, 1.0]; turns at/above this enqueue a job.
+    #[serde(default)]
+    pub reflection_threshold: f32,
+    /// Max distillations per calendar day (UTC). 0 disables distillation.
+    #[serde(default)]
+    pub daily_cap: u32,
+    /// When true, distilled skills for NON-protected names are created
+    /// enabled (no draft/approval step). Protected skills always require
+    /// approval. Default false (mirrors allow_skill_mutation posture).
+    #[serde(default)]
+    pub auto_approve_non_protected: bool,
+    /// Interval in hours for the memory-consolidation nudge background task.
+    /// 0 disables the task (matches MemoryConfig.consolidation_interval_hours convention).
+    #[serde(default)]
+    pub consolidation_nudge_hours: u64,
+    /// Number of repeated failure-then-recovery events on one skill before a
+    /// patch proposal is raised.
+    #[serde(default)]
+    pub failure_patch_threshold: u32,
+}
+
+impl Default for DistillationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reflection_threshold: 0.5,
+            daily_cap: 10,
+            auto_approve_non_protected: false,
+            consolidation_nudge_hours: 0,
+            failure_patch_threshold: 3,
+        }
+    }
+}
+
 /// Credential vault configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1343,6 +1389,9 @@ pub struct KernelConfig {
     /// kernel ships inert-by-default.
     #[serde(default)]
     pub capabilities: KernelCapabilities,
+    /// Phase 1.1 autonomous skill distillation loop configuration.
+    #[serde(default)]
+    pub distillation: DistillationConfig,
 }
 
 /// Memory reasoning engine config (REQ MR-05).
@@ -1710,6 +1759,7 @@ impl Default for KernelConfig {
             skills: HashMap::new(),
             reasoning: ReasoningConfig::default(),
             capabilities: KernelCapabilities::default(),
+            distillation: DistillationConfig::default(),
         }
     }
 }
@@ -5011,5 +5061,51 @@ shell_env_passthrough = ["*"]
         let toml_in = "[capabilities]\nallow_skill_mutation = true\n";
         let cfg: KernelConfig = toml::from_str(toml_in).unwrap();
         assert!(cfg.capabilities.allow_skill_mutation);
+    }
+
+    #[test]
+    fn distillation_config_parses_explicit_values() {
+        // SD-X-01: a [distillation] TOML block with all fields set deserializes correctly.
+        let toml_in = "\
+enabled = true\n\
+reflection_threshold = 0.6\n\
+daily_cap = 5\n\
+auto_approve_non_protected = false\n\
+consolidation_nudge_hours = 6\n\
+failure_patch_threshold = 3\n";
+        let cfg: DistillationConfig = toml::from_str(toml_in).unwrap();
+        assert!(cfg.enabled);
+        assert!((cfg.reflection_threshold - 0.6_f32).abs() < 1e-6);
+        assert_eq!(cfg.daily_cap, 5);
+        assert!(!cfg.auto_approve_non_protected);
+        assert_eq!(cfg.consolidation_nudge_hours, 6);
+        assert_eq!(cfg.failure_patch_threshold, 3);
+    }
+
+    #[test]
+    fn kernel_config_default_distillation() {
+        // SD-X-02: KernelConfig::default().distillation matches DistillationConfig::default().
+        let cfg = KernelConfig::default();
+        let d = &cfg.distillation;
+        assert!(!d.enabled);
+        assert!((d.reflection_threshold - 0.5_f32).abs() < 1e-6);
+        assert_eq!(d.daily_cap, 10);
+        assert!(!d.auto_approve_non_protected);
+        assert_eq!(d.consolidation_nudge_hours, 0);
+        assert_eq!(d.failure_patch_threshold, 3);
+    }
+
+    #[test]
+    fn distillation_config_omitted_section_uses_defaults() {
+        // SD-X-03: if the TOML document has no [distillation] block, the field
+        // defaults via `#[serde(default)]`.
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            distillation: DistillationConfig,
+        }
+        let cfg: Wrapper = toml::from_str("").unwrap();
+        let d = cfg.distillation;
+        assert_eq!(d, DistillationConfig::default());
     }
 }
