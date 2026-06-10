@@ -75,7 +75,6 @@ Tracked in [`01-CONTEXT.md`](phases/01-self-learning-core/01-CONTEXT.md). Top th
 
 ---
 
-<<<<<<< HEAD
 ## Phase 1.1: Autonomous Skill Distillation Loop (INSERTED)
 
 **Slug:** `01.1-autonomous-skill-distillation-loop`

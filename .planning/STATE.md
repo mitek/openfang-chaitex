@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.6.9
 milestone_name: milestone
 status: executing
-last_updated: "2026-06-10T05:38:49Z"
+last_updated: "2026-06-10T05:49:13.340Z"
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 24
-  completed_plans: 17
-  percent: 71
+  completed_plans: 20
+  percent: 83
 ---
 
 # STATE
@@ -27,7 +27,7 @@ Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
 Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker), 01.1-04 (draft-skill lifecycle + dedupe).
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + dedupe).
 - **Status:** Executing Phase 01.1
 - **Progress:** ▓▓▓▓▓░░░░░ 50% — Wave 1 (plans 01-04) complete, Wave 2 (05-06) next.
 
