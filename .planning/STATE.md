@@ -31,6 +31,13 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 - **Status:** Executing Phase 01.1 — Wave 2 done, Wave 3 (API endpoints) next
 - **Progress:** ▓▓▓▓▓▓▓▓░░ 75% — 6/8 plans done (waves 1-2), Wave 3 (07) next.
 
+### Session handoff (2026-06-10, switching dev machine)
+
+- Waves 1-2 (plans 01.1-01..06) merged to `main`; all worktree branches deleted.
+- Per-plan gates were green in each executor worktree; post-merge full-workspace `cargo test` + `clippy -D warnings` was still in flight when this machine was paused — **re-run all three gates first thing on the new machine**.
+- Resume with: `/gsd:execute-phase 1.1` (discovers SUMMARYs, picks up at Wave 3 = plan 01.1-07, API endpoints; then Wave 4 = plan 01.1-08, gates + CHANGELOG + live UAT human-verify checkpoint).
+- `scripts/build-platforms.sh` added this session (per-platform build/run guide incl. pc162 cross-compile + deploy).
+
 ## Performance metrics (Phase 1.1)
 
 - Plan 01.1-01: DistillationConfig + Phase 1.1 requirements; commits d8c0c52/e48dfca/fca9136; 3 TDD tests; ~6.5 min
