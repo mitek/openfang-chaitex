@@ -1,3 +1,17 @@
+---
+gsd_state_version: 1.0
+milestone: v0.6.9
+milestone_name: milestone
+status: executing
+last_updated: "2026-06-10T05:31:12.945Z"
+progress:
+  total_phases: 1
+  completed_phases: 0
+  total_plans: 8
+  completed_plans: 0
+  percent: 100
+---
+
 # STATE
 
 **Updated:** 2026-06-06
@@ -5,14 +19,17 @@
 ## Project reference
 
 - **Core value:** self-learning agent OS that fits on pc162 (1.9 GB ARM).
-- **Current focus:** Phase 1 — Self-Learning Core (skill self-patching, FTS5 session search, memory reasoning).
+- **Current focus:** Phase 01.1 — autonomous-skill-distillation-loop
 
 ## Current position
 
+Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
+Plan: 1 of 8
+
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
 - **Wave:** all 5 waves shipped + W3.5 cross-cutting fix + UAT-found `b2b056d` daemon-start fix. 16/16 plans done.
-- **Status:** Phase 1 100% complete + signed off. Four new agent tools live and exercised end-to-end via DeepSeek: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green; 12/12 success criteria addressed (10 PASS, 1 PASS via unit tests with live deferred, 1 WIRED with documented UX follow-up).
-- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 02 (Tool Expansion) — currently unscoped, awaits inventory of which Hermes tools to bring across.
+- **Status:** Executing Phase 01.1
+- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 1.1 (Autonomous Skill Distillation Loop, INSERTED 2026-06-10) — then 02 (Tool Expansion, currently unscoped).
 
 ## Performance metrics
 
@@ -28,7 +45,9 @@
 
 ## Accumulated context
 
-### Decisions made during W4 execution (2026-06-08)
+### Roadmap Evolution
+
+- Phase 1.1 inserted after Phase 1 (2026-06-10): Autonomous Skill Distillation Loop — close the self-learning loop with autonomy wiring (post-task reflection → skill distillation, skill self-improvement on failure-then-recovery, cron-driven memory consolidation) over Phase 1 mechanisms (`skill_manage`, FTS5, `memory_reason`, `memory_conclude`, BudgetTracker). Motivated by competitive analysis vs. Hermes Agent (its headline "closed learning loop" feature); OpenFang differentiator is running the loop behind existing security gates + budget ceilings. (INSERTED)
 
 - **`SessionStore::search_sessions_fts` is the canonical FTS5 query path.** Plan 01-04 lifted the SQL from `openfang-reasoning::fact_retrieval::fts5_session_search`; `fact_retrieval` now delegates to the memory-crate method. Single source of truth for FTS5 BM25 + snippet rendering. The `SessionSearchHit` struct lives in `openfang-memory`.
 - **`execute_tool -> ToolResult` signature preserved**, parallel `execute_tool_with_outcome -> ToolOutcome` wrapper added by plan 01-09. The agent loop migrated to the new wrapper; ~15 existing test sites and the `openfang-api` route continue using the legacy signature with no behavior change. Zero downstream blast radius. Pragmatic deviation from the plan's literal "promote at all call sites" wording.
@@ -150,4 +169,4 @@ None.
 - Two follow-ups for post-Phase-1 polish (not blocking):
   - **ApprovalRequired terminal-state UX** — `tool_memory_reason` should return `Err(...)` (or `is_error: true`) instead of `Ok(json_with_error_field)` so the agent's loop guard catches it on the first attempt and the structured cost prompt surfaces to the user instead of "Max iterations exceeded".
   - **Budget exposure endpoint** — add `/api/reasoning/budget` (or fold into `/api/budget`) so warn-downgrade and block paths can be probed live without daemon restarts.
-- **Next phase: 02 — Tool Expansion** (currently unscoped). Pre-Phase-2 work: inventory Hermes built-in tools against current OpenFang built-ins to pick the ~27 highest-value additions. See [`ROADMAP.md`](ROADMAP.md#phase-2--tool-expansion).
+- **Next phase: 1.1 — Autonomous Skill Distillation Loop** (INSERTED 2026-06-10, not yet planned). See [`ROADMAP.md`](ROADMAP.md#phase-11--autonomous-skill-distillation-loop-inserted). After that: 02 — Tool Expansion (currently unscoped; pre-Phase-2 work: inventory Hermes built-in tools against current OpenFang built-ins to pick the ~27 highest-value additions).
