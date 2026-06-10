@@ -12,6 +12,7 @@ Three sequential phases extend OpenFang with self-learning capabilities to close
 | # | Phase | Status | Started | Completed |
 |---|-------|--------|---------|-----------|
 | 1 | Self-Learning Core | ✅ shipped + signed off | 2026-06-06 | 2026-06-08 |
+| 1.1 | Autonomous Skill Distillation Loop | in progress (2/8 plans) | 2026-06-10 | — |
 | 2 | Tool Expansion | not started | — | — |
 | 3 | Coordination | not started | — | — |
 
@@ -71,6 +72,36 @@ Tracked in [`01-CONTEXT.md`](phases/01-self-learning-core/01-CONTEXT.md). Top th
 - FTS5 backfill performance on pc162 SD card (mitigation: `fts_backfill = "lazy"` config escape).
 - LLM call latency for reasoning on a slow-connection pc162 (mitigation: Minimal/Low levels skip LLM entirely, Max requires explicit user approval).
 - Single `Arc<Mutex<Connection>>` contention as session_search adds read traffic (mitigation: measure first; connection-pool refactor is Phase 1.5 or 2 candidate, not Phase 1).
+
+---
+
+## Phase 1.1 — Autonomous Skill Distillation Loop
+
+**Slug:** `01.1-autonomous-skill-distillation-loop`
+**Estimated effort:** 1-2 weeks
+**Status:** in progress — 2/8 plans complete
+**Started:** 2026-06-10
+
+### Goal
+
+Automatically detect when a multi-step agent turn demonstrates a reusable procedure (scored by pure-Rust heuristic), synthesize a skill draft via LLM, route it through the existing review/approval queue, and on approval patch it into the live skill registry — closing the loop from raw agent turns to persistent skills with zero human authoring.
+
+### Plans
+
+| Plan | Name | Status |
+|------|------|--------|
+| 01.1-01 | TurnScorer trait + distillation config | complete |
+| 01.1-02 | TurnStats + error_recovery_count | complete (`c812f7c`, `dd5612e`) |
+| 01.1-03 | SkillDraft type + storage | pending |
+| 01.1-04 | DistillationEngine scaffold | pending |
+| 01.1-05 | Post-turn kernel hook + threshold gate | pending |
+| 01.1-06 | LLM synthesis (SkillDraft population) | pending |
+| 01.1-07 | Review queue + approval routing | pending |
+| 01.1-08 | Registry write-back + end-to-end | pending |
+
+### Dependencies
+
+Phase 1 (SkillRegistry mutation surface, skill_manage tool, snapshot refresh signal, KernelLlm trait).
 
 ---
 

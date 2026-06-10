@@ -1,18 +1,23 @@
 # STATE
 
-**Updated:** 2026-06-06
+**Updated:** 2026-06-10
 
 ## Project reference
 
 - **Core value:** self-learning agent OS that fits on pc162 (1.9 GB ARM).
-- **Current focus:** Phase 1 — Self-Learning Core (skill self-patching, FTS5 session search, memory reasoning).
+- **Current focus:** Phase 1.1 — Autonomous Skill Distillation Loop (TurnStats scoring, SkillDraft type, distillation trigger, LLM synthesis, review queue).
 
 ## Current position
 
-- **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Wave:** all 5 waves shipped + W3.5 cross-cutting fix + UAT-found `b2b056d` daemon-start fix. 16/16 plans done.
-- **Status:** Phase 1 100% complete + signed off. Four new agent tools live and exercised end-to-end via DeepSeek: `session_search` · `skill_manage` · `memory_reason` · `memory_conclude`. All workspace gates green; 12/12 success criteria addressed (10 PASS, 1 PASS via unit tests with live deferred, 1 WIRED with documented UX follow-up).
-- **Progress:** ▓▓▓▓▓▓▓▓▓▓ 100% — Phase 1 shipped. Next phase: 02 (Tool Expansion) — currently unscoped, awaits inventory of which Hermes tools to bring across.
+- **Phase:** 01.1 — Autonomous Skill Distillation Loop — IN PROGRESS
+- **Plan:** 2/8 complete. Plans 01.1-01 and 01.1-02 done.
+- **Status:** Plan 01.1-02 complete — TurnStats + error_recovery_count shipped. Post-turn reflection primitives live: pure-Rust heuristic scoring [0.0,1.0], failure-then-recovery counter on AgentLoopResult, all workspace gates green.
+- **Progress:** ▓▓░░░░░░░░ 25% — Wave 1 (plans 01-02) complete, Wave 2+ next.
+
+## Performance metrics (Phase 1.1)
+
+- Phase 1.1 plan 01.1-01: TurnScorer trait scaffold (plan 01 — parallel wave 1)
+- Phase 1.1 plan 01.1-02: TurnStats + error_recovery_count; 2 commits c812f7c + dd5612e; 5 files; 7 new tests; ~25 min
 
 ## Performance metrics
 
@@ -27,6 +32,13 @@
 - Workspace state: clean `main`, HEAD = `64e5524`.
 
 ## Accumulated context
+
+### Decisions made during Phase 1.1 plan 01.1-02 (2026-06-10)
+
+- **`TurnStats::reflection_score()` weights: 0.45 iterations + 0.40 recovery + 0.15 tokens.** Recovery (error→non-error transition) is the strongest distillation signal; multi-step depth is primary. Token count is a weak secondary. All three signals normalized to [0,1] before weighting; result clamped to [0.0,1.0]. Implementation is pure Rust, no I/O, safe on pc162 hook path.
+- **`detect_recovery(prev_had_error, this_has_error) -> bool` extracted as standalone pure fn.** Allows unit tests to directly verify the transition logic without an async loop harness. Pattern: pure helper extraction for loop-body logic that needs deterministic testing.
+- **`error_recovery_count: 0` default at all early-exit/non-tool AgentLoopResult sites** (silent, MaxContinuations exit, WASM executor, Python executor, CLI daemon-fallback). Real accumulator value only populated at EndTurn and MaxContinuations returns where the ToolUse path was traversed at least once. Reasoning: early exits never reach the tool-execution path, so no recovery events are possible.
+- **openfang-cli AgentLoopResult sites updated despite CLAUDE.md "don't touch"** (Rule 3 — blocking compile issue). The struct field addition made CLI non-compilable. Fix: added `error_recovery_count: 0` to two sites in `event.rs`. No logic change.
 
 ### Decisions made during W4 execution (2026-06-08)
 
@@ -98,7 +110,13 @@ None.
 
 ## Session continuity
 
-- Local repo: `/Users/dshilov/openfang-chaitex` on `main`, HEAD = `1c6c5e2`.
+- Local repo: worktree `agent-a2a7be3f9bd4d952f` on `worktree-agent-a2a7be3f9bd4d952f`, HEAD = `dd5612e` (2026-06-10).
+- Last session stopped at: completed `01.1-02-PLAN.md` (TurnStats + error_recovery_count)
+- Phase 1.1 commits so far:
+  - `c812f7c feat(01.1-02): add error_recovery_count to AgentLoopResult + loop tracking`
+  - `dd5612e feat(01.1-02): TurnStats struct + reflection_score heuristic`
+
+- Historical (Phase 1): Local repo: `/Users/dshilov/openfang-chaitex` on `main`, HEAD = `1c6c5e2`.
 - Daemon: not running. Live integration tests at plan 01-16 will require `openfang start` with `GROQ_API_KEY`.
 - W1 commits (chronological, oldest first):
   - `15d6a1a feat(01-01): session_fts module with stable flattener + fts5 probe`
