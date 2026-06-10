@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.6.9
 milestone_name: milestone
 status: executing
-last_updated: "2026-06-10T05:49:13.340Z"
+last_updated: "2026-06-10T12:00:00.000Z"
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 24
-  completed_plans: 20
-  percent: 83
+  completed_plans: 21
+  percent: 88
 ---
 
 # STATE
@@ -27,9 +27,9 @@ Phase: 01.1 (autonomous-skill-distillation-loop) — EXECUTING
 Plan: Wave 1 (4 plans) complete; Wave 2 next
 
 - **Phase:** 01 — Self-Learning Core — **COMPLETE** (signed off 2026-06-08 by Dmitry Shilov)
-- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 (DistillationConfig + requirements), 01.1-02 (TurnStats + error_recovery_count), 01.1-03 (SkillFailureTracker — DashMap-backed, 20-event bounded, 7-day TTL-decaying, per-(skill,agent) key), 01.1-04 (draft-skill lifecycle + Jaccard dedupe — Plan 05's worker can now call is_duplicate_candidate, create_draft_skill, approve_draft_skill, list_drafts).
+- **Phase 01.1:** EXECUTING — Wave 1 complete: 01.1-01 through 01.1-04. Wave 2: 01.1-06 complete (skill-failure recording, propose_skill_patch routing, memory-consolidation nudge). 01.1-05 (distillation queue + worker) in parallel.
 - **Status:** Executing Phase 01.1
-- **Progress:** ▓▓▓▓▓░░░░░ 50% — Wave 1 (plans 01-04) complete, Wave 2 (05-06) next.
+- **Progress:** ▓▓▓▓▓▓░░░░ 63% — 5/8 plans done (01-04 + 06), Wave 2 partially complete.
 
 ## Performance metrics (Phase 1.1)
 
@@ -37,6 +37,7 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 - Plan 01.1-02: TurnStats + error_recovery_count; commits c812f7c + dd5612e; 5 files; 7 new tests; ~25 min
 - Plan 01.1-03: SkillFailureTracker; commit cb59887; 5 TDD tests; ~15 min
 - Plan 01.1-04: draft lifecycle + dedupe; commit 13a2e1c; 8 TDD tests; ~18 min
+- Plan 01.1-06: skill-failure recording + patch proposals + consolidation nudge; commits 066b75c/5c2a0ff/f05b240; 3 files; ~40 min
 
 ## Performance metrics
 
@@ -55,6 +56,14 @@ Plan: Wave 1 (4 plans) complete; Wave 2 next
 ### Roadmap Evolution
 
 - Phase 1.1 inserted after Phase 1 (2026-06-10): Autonomous Skill Distillation Loop — close the self-learning loop with autonomy wiring (post-task reflection → skill distillation, skill self-improvement on failure-then-recovery, cron-driven memory consolidation) over Phase 1 mechanisms (`skill_manage`, FTS5, `memory_reason`, `memory_conclude`, BudgetTracker). Motivated by competitive analysis vs. Hermes Agent (its headline "closed learning loop" feature); OpenFang differentiator is running the loop behind existing security gates + budget ceilings. (INSERTED)
+
+### Decisions made during Phase 1.1 Plan 01.1-06 execution (2026-06-10)
+
+- **`propose_skill_patch` uses fail-safe protected logic** — missing skill OR `None` protected flag treated as `true` (protected). This prevents a newly-created skill without an explicit `protected` field from accidentally bypassing the approval gate.
+- **`ApprovalManager` is not Clone; spawned via upgraded self-Arc** — `tokio::spawn` fire-and-forget keeps the `ApprovalManager` alive without requiring it to be cloneable or wrapped in an extra `Arc`. Pattern applicable wherever a non-Clone kernel component needs to be used from a spawned task.
+- **Memory-consolidation nudge uses same persistence path as `memory_conclude` tool** — `load_profile`/`add_fact`/`save_profile` from `openfang_reasoning::profile`. This ensures the nudge's persisted facts appear in the same place as agent-triggered conclusions.
+- **Confidence threshold of 0.7 for nudge persistence** — below 0.7 the synthesis is too speculative to be worth persisting as a durable `UserFact`. Same bar as RESEARCH.md recommendation.
+- **Nudge uses `FactSource::MemoryReason { level: "medium" }` to mark auto-persisted facts** — distinguishes automated nudge output from agent-triggered `memory_conclude` calls in the profile audit trail.
 
 ### Decisions made during Phase 1.1 execution (2026-06-10)
 
